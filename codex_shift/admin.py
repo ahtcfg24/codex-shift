@@ -492,6 +492,18 @@ ADMIN_HTML = """<!doctype html>
     #status.ok { color: var(--ok); }
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 1040px; }
+    .providers-table {
+      table-layout: fixed;
+      min-width: 1712px;
+    }
+    .providers-table .col-provider { width: 190px; }
+    .providers-table .col-enabled { width: 84px; }
+    .providers-table .col-weight { width: 84px; }
+    .providers-table .col-protocol { width: 172px; }
+    .providers-table .col-upstream { width: 310px; }
+    .providers-table .col-auth { width: 220px; }
+    .providers-table .col-models { width: 560px; }
+    .providers-table .col-actions { width: 92px; }
     th, td {
       padding: 11px 12px;
       text-align: left;
@@ -515,7 +527,8 @@ ADMIN_HTML = """<!doctype html>
     .field-note { color: var(--muted); font-size: 12px; }
     .provider-name { min-width: 150px; }
     .endpoint { min-width: 260px; }
-    .number { max-width: 110px; }
+    .number { width: 60px; min-width: 60px; max-width: none; }
+    .protocol-select { min-width: 148px; }
     .models-editor { display: grid; gap: 8px; min-width: 520px; }
     .model-row {
       display: grid;
@@ -591,7 +604,17 @@ ADMIN_HTML = """<!doctype html>
         <div id="status"></div>
       </div>
       <div class="table-wrap">
-        <table>
+        <table class="providers-table">
+          <colgroup>
+            <col class="col-provider">
+            <col class="col-enabled">
+            <col class="col-weight">
+            <col class="col-protocol">
+            <col class="col-upstream">
+            <col class="col-auth">
+            <col class="col-models">
+            <col class="col-actions">
+          </colgroup>
           <thead>
             <tr>
               <th>Provider</th>
@@ -792,7 +815,7 @@ ADMIN_HTML = """<!doctype html>
           <td><input type="checkbox" data-provider="${index}" data-field="enabled" ${p.enabled ? "checked" : ""}></td>
           <td><input class="number" type="number" min="0" step="0.1" data-provider="${index}" data-field="weight" value="${esc(p.weight)}"></td>
           <td>
-            <select data-provider="${index}" data-field="outbound">
+            <select class="protocol-select" data-provider="${index}" data-field="outbound">
               <option value="chat_completions" ${p.outbound === "chat_completions" ? "selected" : ""}>chat_completions</option>
               <option value="responses" ${p.outbound === "responses" ? "selected" : ""}>responses</option>
             </select>
