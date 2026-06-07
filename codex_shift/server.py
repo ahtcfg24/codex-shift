@@ -26,10 +26,10 @@ DEFAULT_CONFIG_PATH = os.environ.get("CODEX_SHIFT_CONFIG", "config.yaml")
 
 
 def _passthrough_payload(body: dict[str, Any], model: str | None) -> dict[str, Any]:
-    """responses 全透传: 请求体原样透传,仅按 model_map 改写 model 字段。
+    """responses 全透传: 请求体原样透传,仅按 provider 内部映射改写 model 字段。
 
     入站与上游同为 Responses 协议,无需任何结构转换;唯一改写是把 model 换为
-    映射后的出站名(若配置了 model_map),其余字段(input/tools/reasoning/stream 等)保持不变。
+    选中 provider 的出站模型名,其余字段(input/tools/reasoning/stream 等)保持不变。
     """
     payload = dict(body)
     if model is not None:
@@ -41,7 +41,7 @@ def _build_request_payload(provider: ProviderConfig, body: dict[str, Any],
                            model: str | None) -> dict[str, Any]:
     """根据 provider 出站协议将 Responses 请求体转换为上游请求体。
 
-    model 为经 model_map 映射后的出站(实际)model 名。
+    model 为经 provider 内部映射后的出站(实际)model 名。
     """
     if provider.outbound == OUTBOUND_RESPONSES:
         return _passthrough_payload(body, model)
@@ -202,7 +202,7 @@ def create_app(cfg: Config, *, config_path: str | None = None) -> FastAPI:
     async def admin_config() -> dict[str, Any]:
         """返回当前 provider 控制项。"""
         cur = current_config()
-        return {"providers": admin.provider_summary(cur)}
+        return {"providers": admin.provider_summary(cur, runtime.path)}
 
     @app.post("/admin/api/config")
     async def save_admin_config(request: Request) -> JSONResponse:
@@ -219,7 +219,7 @@ def create_app(cfg: Config, *, config_path: str | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 配置错误要返回给控制台
             logger.warning("控制台保存配置失败: %s", exc)
             return _error_response(400, f"保存配置失败: {exc}", etype="invalid_request_error")
-        return JSONResponse(content={"providers": admin.provider_summary(cur)})
+        return JSONResponse(content={"providers": admin.provider_summary(cur, runtime.path)})
 
     @app.get("/v1/models")
     @app.get("/models")
@@ -260,15 +260,15 @@ def create_app(cfg: Config, *, config_path: str | None = None) -> FastAPI:
         logger.info("[%s] 入站请求 model=%s", rid, request_model)
 
         cur = current_config()
-        # 路由: 按入站 model 经 model_map 映射后定位 provider;重复模型按权重选择
+        # 路由: 按入站 model 定位 provider;重复模型按权重选择,再取 provider 内部出站映射。
         provider, mapped_model = cur.resolve(request_model)
         if provider is None:
-            logger.warning("[%s] 无法为 model=%s(映射后=%s)路由到任何 provider",
+            logger.warning("[%s] 无法为 model=%s(出站候选=%s)路由到任何 provider",
                            rid, request_model, mapped_model)
             return _error_response(
                 404,
-                f"无法为 model {request_model!r}(映射后 {mapped_model!r})找到匹配的 provider;"
-                f"请在某个 provider 的 models 中声明该 model 名",
+                f"无法为入站 model {request_model!r} 找到匹配的 provider;"
+                f"请在某个 provider 的 models[].name 中声明该 model 名",
                 etype="model_not_found",
             )
 

@@ -19,10 +19,10 @@ Codex 使用 Responses 协议工作，但很多模型供应商仍以 Chat Comple
 - **responses 协议转换**：将 chat/completions 协议和 responses 协议的 api 统一转换为 `POST /v1/responses`。
 - **多 Provider 路由**：同一配置中管理 DeepSeek、Qwen、MiMo、内部网关等上游，并按模型名自动选择 provider。
 - **Codex 模型目录**：通过实现 responses 协议的 `/models`接口 暴露 Codex 兼容的 `ModelInfo`，让自定义模型获得真实上下文窗口，比如开启 1M 上下文窗口，而不是 codex 内置的 272k。
-- **本地热管理**：内置本地控制台，通过 `/admin`进入控制台，图形界面化启停 provider、调整权重并保存配置，不需要重启进程。
+- **本地热管理**：内置本地控制台，通过 `/admin` 进入控制台，图形界面化增删 provider、调整权重、维护模型列表与上下文窗口并保存配置，不需要重启进程。
 - **错误语义统一**：上游超时、非法 JSON、API 错误会转换为 Responses 风格错误响应。
 - **纯本地转换**：轻量，简洁的本地转换，不做路由和转换以外的多余动作，性能几乎无损。
-- **模型别名映射**：例如把 mimo-v2.5-pro 映射为 gpt-5.5，如果你在使用 codex 时，希望特定场景只用特定供应商的特定模型，这个映射功能将派上用场。
+- **Provider 内模型映射**：例如对外暴露 `gpt-5.5`，但在某个 provider 内部实际发往 `mimo-v2.5-pro` 或 `deepseek-v4-pro`。
 
 ## 核心能力
 
@@ -34,7 +34,7 @@ Codex 使用 Responses 协议工作，但很多模型供应商仍以 Chat Comple
 
 ### 路由与模型目录
 
-- `model_map` 支持入站模型名到上游模型名的映射。
+- `models[].mapped_model` 支持在每个 provider 内把入站模型名映射为上游模型名。
 - 多个 provider 声明同一模型时，按 `weight` 做加权选择。
 - `/models` 基于内置 Codex `ModelInfo` 模板克隆条目，只覆盖 slug 与上下文窗口等元数据。
 

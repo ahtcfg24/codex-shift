@@ -121,7 +121,7 @@ def _render(template: dict[str, Any], cfg: Config, slug: str,
 
 
 def _find_meta(cfg: Config, model_name: str) -> ModelMeta | None:
-    """在所有 provider 中查找指定 model 名的 ModelMeta(用于 model_map 别名继承)。"""
+    """在所有 provider 中查找指定入站 model 名的 ModelMeta(旧 model_map 兼容用)。"""
     for p in cfg.active_providers:
         meta = p.model_meta.get(model_name)
         if meta is not None:
@@ -133,8 +133,8 @@ def build_models_catalog(cfg: Config) -> dict[str, Any]:
     """构建 codex 兼容的 /models 目录: ``{"models": [ModelInfo, ...]}``。
 
     收录范围(仅当解析出非空 context_window 时收录):
-    1. 各 provider 声明的 model 名(使用其自身 ModelMeta);
-    2. model_map 的别名键(入站名),其上下文继承自映射目标模型的 ModelMeta,
+    1. 各 provider 声明的入站 model 名(使用其自身 ModelMeta);
+    2. 旧版顶层 model_map 的别名键,其上下文继承自映射目标模型的 ModelMeta,
        目标无元数据时回退全局默认。
 
     同名去重: provider 模型优先于别名。
@@ -142,7 +142,7 @@ def build_models_catalog(cfg: Config) -> dict[str, Any]:
     template = _load_template(cfg)
     entries: dict[str, dict[str, Any]] = {}
 
-    # 1. provider 声明的模型
+    # 1. provider 声明的入站模型
     for p in cfg.active_providers:
         for name in p.models:
             meta = p.model_meta.get(name)
@@ -152,7 +152,7 @@ def build_models_catalog(cfg: Config) -> dict[str, Any]:
                 continue
             entries[name] = _render(template, cfg, name, meta, cw)
 
-    # 2. model_map 别名(入站名)
+    # 2. 旧版顶层 model_map 别名(兼容旧配置)
     for alias, target in cfg.model_map.items():
         if alias in entries:
             continue

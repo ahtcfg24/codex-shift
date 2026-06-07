@@ -4,9 +4,9 @@
 
 配置模型:
 - 支持配置多个 provider(如 deepseek / mimo / qwen / glm 同时配置)。
-- 每个 provider 拥有独立的出站协议(outbound)、上游地址、鉴权、超时及其支持的 model 列表。
-- 入站 model 名经全局 model_map 映射后作为路由键;
-  同一模型可由多个启用 provider 提供,请求时按 provider 权重选择。
+- 每个 provider 拥有独立的出站协议(outbound)、上游地址、鉴权、超时及其支持的入站 model 列表。
+- 每个 provider 可为单个入站 model 配置 mapped_model,用于发送给该 provider 的出站模型名;
+  同一入站模型可由多个启用 provider 提供,请求时按 provider 权重选择。
 """
 
 from __future__ import annotations
@@ -74,6 +74,7 @@ class ProviderConfig:
     base_url: str
     api_key: str
     path: str
+    # 这里的 models 是入站模型名,也是 /models 目录对客户端暴露的 slug
     models: list[str]
     # enabled=false 时 provider 不参与路由与 /models 输出,但仍保留在配置中供控制台重新启用
     enabled: bool = True
@@ -81,6 +82,8 @@ class ProviderConfig:
     weight: float = 1.0
     # model 名 -> 该 model 的元数据(仅 models 写成对象形式时才有条目)
     model_meta: dict[str, ModelMeta] = field(default_factory=dict)
+    # 入站 model 名 -> 该 provider 实际出站 model 名;未配置时默认同名
+    model_map: dict[str, str] = field(default_factory=dict)
     timeout: float = 300.0
     # 出站为 chat 时是否透传未识别的顶层字段
     passthrough_unknown: bool = True
@@ -109,7 +112,7 @@ class Config:
     default_base_instructions: str | None = None
     # /models 模板文件路径(自定义 ModelInfo 模板);为空时使用内置 gpt-5.5 模板
     model_template_path: str | None = None
-    # 路由索引: 出站(映射后)model 名 -> 启用 provider 候选列表;构造后填充
+    # 路由索引: 入站 model 名 -> 启用 provider 候选列表;构造后填充
     _model_index: dict[str, list[ProviderConfig]] = field(default_factory=dict, repr=False)
     _catch_all: ProviderConfig | None = field(default=None, repr=False)
 
@@ -119,7 +122,7 @@ class Config:
         return [p for p in self.providers if p.enabled]
 
     def map_model(self, model: str | None) -> str | None:
-        """按全局 model_map 映射模型名,未命中则原样返回。"""
+        """按全局 model_map 映射模型名,仅用于旧配置兼容。"""
         if model is None:
             return None
         return self.model_map.get(model, model)
@@ -128,19 +131,35 @@ class Config:
         """按入站 model 解析目标 provider 与出站 model 名。
 
         流程:
-        1. 经 model_map 映射得到出站(实际)model 名;
-        2. 以该名精确匹配启用 provider 的 models 列表;
-        3. 未命中时若存在兜底 provider(models 为空)则路由到它;
-        4. 仍无匹配返回 (None, 出站model名),由调用方报错。
+        1. 以入站 model 名精确匹配启用 provider 的 models 列表;
+        2. 命中后按 provider.model_map 将入站 model 映射为该 provider 的出站 model 名;
+        3. 未命中时尝试旧版全局 model_map 兼容路径;
+        4. 仍未命中时若存在兜底 provider(models 为空)则路由到它;
+        5. 仍无匹配返回 (None, 入站或兼容映射后的 model 名),由调用方报错。
 
         返回 (provider 或 None, 出站 model 名 或 None)。
         """
-        effective = self.map_model(model)
-        if effective is not None and effective in self._model_index:
-            return _pick_weighted(self._model_index[effective]), effective
+        inbound = model
+        if inbound is not None and inbound in self._model_index:
+            provider = _pick_weighted(self._model_index[inbound])
+            return provider, _provider_outbound_model(provider, inbound)
+
+        # 兼容旧版顶层 model_map: 入站别名 -> provider models 中声明的旧出站名。
+        effective = self.map_model(inbound)
+        if effective is not None and effective != inbound and effective in self._model_index:
+            provider = _pick_weighted(self._model_index[effective])
+            return provider, _provider_outbound_model(provider, effective)
+
         if self._catch_all is not None:
             return self._catch_all, effective
         return None, effective
+
+
+def _provider_outbound_model(provider: ProviderConfig | None, inbound_model: str | None) -> str | None:
+    """按 provider 内部映射得到实际发给上游的 model 名。"""
+    if provider is None or inbound_model is None:
+        return inbound_model
+    return provider.model_map.get(inbound_model, inbound_model)
 
 
 def _pick_weighted(providers: list[ProviderConfig]) -> ProviderConfig | None:
@@ -202,14 +221,15 @@ def _build_model_meta(provider_name: str, name: str, raw: dict[str, Any]) -> Mod
     )
 
 
-def _parse_models(provider_name: str, models_raw: Any) -> tuple[list[str], dict[str, ModelMeta]]:
+def _parse_models(provider_name: str, models_raw: Any) -> tuple[list[str], dict[str, ModelMeta], dict[str, str]]:
     """解析 provider 的 models 列表。
 
     兼容两种条目写法,可在同一列表中混用:
-    - 字符串: 仅 model 名,无附加元数据;
-    - 对象: 必含 `name`,可附带 context_window 等元数据(供 /models 暴露)。
+    - 字符串: 入站 model 名,出站 model 默认同名,无附加元数据;
+    - 对象: 必含 `name`,可附带 context_window 等元数据(供 /models 暴露),
+      以及 mapped_model(实际发给该 provider 的模型名)。
 
-    返回 (model 名列表[保持声明顺序], model 名 -> ModelMeta 映射)。
+    返回 (入站 model 名列表[保持声明顺序], model 名 -> ModelMeta 映射, model 名 -> 出站 model 名)。
     """
     if not isinstance(models_raw, list):
         raise ValueError(f"provider {provider_name!r} 的 models 必须是列表")
@@ -217,15 +237,22 @@ def _parse_models(provider_name: str, models_raw: Any) -> tuple[list[str], dict[
     seen: set[str] = set()
     models: list[str] = []
     meta_map: dict[str, ModelMeta] = {}
+    model_map: dict[str, str] = {}
     for m in models_raw:
         if isinstance(m, dict):
             name = str(m.get("name") or "").strip()
             if not name:
                 raise ValueError(f"provider {provider_name!r} 的 models 对象条目缺少 name 字段")
             meta: ModelMeta | None = _build_model_meta(provider_name, name, m)
+            mapped_model = str(
+                m.get("mapped_model") or m.get("target_model") or m.get("upstream_model") or name
+            ).strip()
+            if not mapped_model:
+                mapped_model = name
         else:
             name = str(m).strip()
             meta = None
+            mapped_model = name
         if not name:
             continue
         if name in seen:
@@ -234,7 +261,8 @@ def _parse_models(provider_name: str, models_raw: Any) -> tuple[list[str], dict[
         models.append(name)
         if meta is not None:
             meta_map[name] = meta
-    return models, meta_map
+        model_map[name] = mapped_model
+    return models, meta_map, model_map
 
 
 def _build_provider(name: str, raw: dict[str, Any], *,
@@ -262,7 +290,7 @@ def _build_provider(name: str, raw: dict[str, Any], *,
 
     # models 列表(去重并保持声明顺序);允许为空表示兜底 provider。
     # 条目可为字符串或带元数据的对象(见 _parse_models)。
-    models, model_meta = _parse_models(name, raw.get("models") or [])
+    models, model_meta, provider_model_map = _parse_models(name, raw.get("models") or [])
 
     enabled = bool(raw.get("enabled", True))
     try:
@@ -290,6 +318,7 @@ def _build_provider(name: str, raw: dict[str, Any], *,
         enabled=enabled,
         weight=weight,
         model_meta=model_meta,
+        model_map=provider_model_map,
         timeout=float(raw.get("timeout", 300)),
         passthrough_unknown=bool(_opt("passthrough_unknown", True)),
         catch_all=not models,
@@ -371,7 +400,8 @@ def load_config(path: str) -> Config:
     _mt = global_defaults.get("model_template")
     model_template_path = str(_mt) if _mt else None
 
-    # 全局模型映射: 入站 model -> 出站(实际)model 名,作为路由键
+    # 旧版全局模型映射: 入站 model -> provider models 中声明的模型名。
+    # 新配置应使用 providers[].models[].mapped_model;这里仅用于兼容旧配置。
     model_map_raw = raw.get("model_map") or {}
     if not isinstance(model_map_raw, dict):
         raise ValueError("model_map 必须是映射(对象)")

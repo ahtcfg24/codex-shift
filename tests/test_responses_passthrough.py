@@ -18,15 +18,14 @@ def _cfg(tmp_path, text: str):
 
 
 _CONFIG = """
-    model_map:
-      gpt-alias: gpt-5.5
     providers:
       - name: inner
         outbound: responses
         base_url: https://gw.example.com/v1
         api_key: sk-inner
         models:
-          - name: gpt-5.5
+          - name: gpt-alias
+            mapped_model: gpt-5.5
             context_window: 1050000
 """
 
@@ -41,7 +40,7 @@ def test_responses_default_path_and_outbound(tmp_path):
 
 
 def test_passthrough_payload_rewrites_only_model(tmp_path):
-    """请求体原样透传,仅按 model_map 改写 model;其余字段保持不变。"""
+    """请求体原样透传,仅按 provider 内部 mapped_model 改写 model;其余字段保持不变。"""
     cfg = _cfg(tmp_path, _CONFIG)
     provider, mapped = cfg.resolve("gpt-alias")
     body = {
@@ -122,7 +121,7 @@ def test_stream_passthrough_end_to_end(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server.upstream, "stream_raw", fake_stream_raw)
     with client.stream("POST", "/v1/responses",
-                       json={"model": "gpt-5.5", "input": "hi", "stream": True}) as r:
+                       json={"model": "gpt-alias", "input": "hi", "stream": True}) as r:
         assert r.status_code == 200
         text = "".join(r.iter_text())
     # 原始事件与 [DONE] 均被原样透传
@@ -137,6 +136,23 @@ def test_responses_model_exposed_in_catalog(tmp_path):
     client = TestClient(server.create_app(cfg))
     body = client.get("/models").json()
     slugs = {m["slug"] for m in body["models"]}
-    assert "gpt-5.5" in slugs
-    # 别名也随之暴露
     assert "gpt-alias" in slugs
+    assert "gpt-5.5" not in slugs
+
+
+def test_legacy_global_model_map_still_rewrites_model(tmp_path):
+    """旧版顶层 model_map 仍作为兼容路径工作。"""
+    cfg = _cfg(tmp_path, """
+        model_map:
+          gpt-alias: gpt-5.5
+        providers:
+          - name: inner
+            outbound: responses
+            base_url: https://gw.example.com/v1
+            api_key: sk-inner
+            models: [gpt-5.5]
+    """)
+    provider, mapped = cfg.resolve("gpt-alias")
+    payload = _build_request_payload(provider, {"model": "gpt-alias", "input": "hi"}, mapped)
+    assert provider.name == "inner"
+    assert payload["model"] == "gpt-5.5"

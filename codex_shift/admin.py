@@ -1,4 +1,4 @@
-"""本地配置控制台: 展示 provider 状态,保存 enabled/weight 并热加载。"""
+"""本地配置控制台: 管理 provider、模型上下文窗口并热加载。"""
 
 from __future__ import annotations
 
@@ -36,8 +36,104 @@ class RuntimeConfig:
         return cfg
 
 
-def provider_summary(cfg: Config) -> list[dict[str, Any]]:
+def _read_config_raw(config_path: str) -> dict[str, Any]:
+    """读取原始 YAML 配置,供控制台保留可展示字段。"""
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("配置文件根节点必须是映射(对象)")
+    return raw
+
+
+def _provider_entries(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """把 providers 的列表/映射写法统一为带 name 的列表。"""
+    providers_raw = raw.get("providers")
+    if providers_raw is None:
+        raise ValueError("控制台暂只支持新版 providers 配置")
+    if isinstance(providers_raw, list):
+        entries: list[dict[str, Any]] = []
+        for idx, provider in enumerate(providers_raw):
+            if not isinstance(provider, dict):
+                continue
+            entry = dict(provider)
+            entry["name"] = str(provider.get("name") or f"provider_{idx}").strip()
+            entries.append(entry)
+        return entries
+    if isinstance(providers_raw, dict):
+        entries = []
+        for name, provider in providers_raw.items():
+            if not isinstance(provider, dict):
+                continue
+            entry = dict(provider)
+            entry["name"] = str(name)
+            entries.append(entry)
+        return entries
+    raise ValueError("providers 必须是列表或映射(对象)")
+
+
+def _model_items_from_raw(
+    raw_models: Any,
+    model_names: list[str],
+    model_map: dict[str, str],
+    legacy_aliases: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """返回控制台可编辑的模型条目,保留上下文字段。"""
+    legacy_aliases = legacy_aliases or {}
+    by_name: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_models, list):
+        for item in raw_models:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    by_name[name] = dict(item)
+            else:
+                name = str(item).strip()
+                if name:
+                    by_name[name] = {"name": name}
+
+    result: list[dict[str, Any]] = []
+    ordered = list(model_names)
+    for name in by_name:
+        if name not in ordered:
+            ordered.append(name)
+    for alias, target in legacy_aliases.items():
+        if target in model_names and alias not in ordered:
+            ordered.append(alias)
+    for name in ordered:
+        legacy_target = legacy_aliases.get(name)
+        raw = by_name.get(name) or by_name.get(legacy_target or "") or {"name": name}
+        mapped_model = (
+            raw.get("mapped_model")
+            or raw.get("target_model")
+            or raw.get("upstream_model")
+            or model_map.get(name)
+            or legacy_target
+            or name
+        )
+        result.append({
+            "name": name,
+            "mapped_model": mapped_model,
+            "context_window": raw.get("context_window"),
+            "max_context_window": raw.get("max_context_window"),
+            "auto_compact_token_limit": raw.get("auto_compact_token_limit"),
+            "effective_context_window_percent": raw.get("effective_context_window_percent"),
+        })
+    return result
+
+
+def provider_summary(cfg: Config, config_path: str | None = None) -> list[dict[str, Any]]:
     """返回控制台/API 展示用 provider 摘要。"""
+    raw_by_name: dict[str, dict[str, Any]] = {}
+    legacy_aliases = cfg.model_map
+    if config_path:
+        try:
+            raw = _read_config_raw(config_path)
+            raw_by_name = {p["name"]: p for p in _provider_entries(raw)}
+            raw_model_map = raw.get("model_map")
+            if isinstance(raw_model_map, dict):
+                legacy_aliases = {str(k): str(v) for k, v in raw_model_map.items()}
+        except Exception:
+            raw_by_name = {}
     return [
         {
             "name": p.name,
@@ -47,23 +143,51 @@ def provider_summary(cfg: Config) -> list[dict[str, Any]]:
             "base_url": p.base_url,
             "path": p.path,
             "models": p.models,
+            "model_items": _model_items_from_raw(
+                raw_by_name.get(p.name, {}).get("models"), p.models, p.model_map, legacy_aliases,
+            ),
             "catch_all": p.catch_all,
+            "api_key_env": raw_by_name.get(p.name, {}).get("api_key_env", ""),
+            "api_key_set": bool(raw_by_name.get(p.name, {}).get("api_key")),
+            "timeout": p.timeout,
+            "passthrough_unknown": p.passthrough_unknown,
+            "web_search": p.supports_web_search,
+            "web_search_enabled": p.web_search_enabled,
         }
         for p in cfg.providers
     ]
 
 
-def update_provider_controls(config_path: str, updates: list[dict[str, Any]]) -> None:
-    """只更新配置文件中的 provider enabled/weight 字段。"""
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-    if not isinstance(raw, dict):
-        raise ValueError("配置文件根节点必须是映射(对象)")
+def _is_control_only_update(updates: list[dict[str, Any]]) -> bool:
+    """旧控制台请求只包含 name/enabled/weight,继续走局部更新。"""
+    allowed = {"name", "enabled", "weight"}
+    return bool(updates) and all(
+        isinstance(item, dict) and set(item.keys()) <= allowed for item in updates
+    )
 
+
+def _atomic_write_verified(config_path: str, raw: dict[str, Any]) -> None:
+    """写临时配置并验证,通过后原子替换正式配置。"""
+    directory = os.path.dirname(os.path.abspath(config_path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".codex_shift_config_", suffix=".yaml", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
+        load_config(tmp_path)
+        os.replace(tmp_path, config_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _update_provider_controls_only(raw: dict[str, Any], updates: list[dict[str, Any]]) -> None:
+    """只更新配置文件中的 provider enabled/weight 字段。"""
     providers_raw = raw.get("providers")
     if providers_raw is None:
         raise ValueError("控制台暂只支持新版 providers 配置")
-
     update_map: dict[str, dict[str, Any]] = {}
     for item in updates:
         name = str(item.get("name") or "").strip()
@@ -105,20 +229,151 @@ def update_provider_controls(config_path: str, updates: list[dict[str, Any]]) ->
     if missing:
         raise ValueError(f"配置中不存在这些 provider: {', '.join(missing)}")
 
-    directory = os.path.dirname(os.path.abspath(config_path)) or "."
-    fd, tmp_path = tempfile.mkstemp(prefix=".codex_shift_config_", suffix=".yaml", dir=directory)
+
+def _number_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
-        # 先加载临时配置验证路由/字段约束,通过后再原子替换正式配置。
-        load_config(tmp_path)
-        os.replace(tmp_path, config_path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"上下文窗口字段必须为整数,当前为: {value!r}")
+    if number < 0:
+        raise ValueError("上下文窗口字段不能为负数")
+    return number
+
+
+def _clean_model_items(items: Any, existing_models: Any) -> list[Any]:
+    """清理控制台提交的模型列表,并尽量保留未展示的模型元数据字段。"""
+    if not isinstance(items, list):
+        raise ValueError("provider models 必须是数组")
+    existing: dict[str, dict[str, Any]] = {}
+    if isinstance(existing_models, list):
+        for item in existing_models:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    existing[name] = dict(item)
+
+    cleaned: list[Any] = []
+    seen: set[str] = set()
+    for item in items:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item).strip()
+            item = {"name": name}
+        if not name:
+            continue
+        if name in seen:
+            raise ValueError(f"models 内部存在重复项: {name!r}")
+        seen.add(name)
+
+        base = existing.get(name, {"name": name})
+        base["name"] = name
+        mapped_model = str(
+            item.get("mapped_model") or item.get("target_model") or item.get("upstream_model") or name
+        ).strip()
+        if not mapped_model:
+            mapped_model = name
+        if mapped_model == name:
+            base.pop("mapped_model", None)
+            base.pop("target_model", None)
+            base.pop("upstream_model", None)
+        else:
+            base["mapped_model"] = mapped_model
+        touched_meta = False
+        for key in (
+            "context_window",
+            "max_context_window",
+            "auto_compact_token_limit",
+            "effective_context_window_percent",
+        ):
+            if key in item:
+                value = _number_or_none(item.get(key))
+                touched_meta = touched_meta or value is not None
+                if value is None:
+                    base.pop(key, None)
+                else:
+                    base[key] = value
+        has_meta = any(k in base for k in (
+            "context_window",
+            "max_context_window",
+            "auto_compact_token_limit",
+            "effective_context_window_percent",
+            "display_name",
+            "description",
+            "base_instructions",
+            "mapped_model",
+        ))
+        cleaned.append(base if has_meta or touched_meta else name)
+    return cleaned
+
+
+def _replace_providers(raw: dict[str, Any], submitted: list[dict[str, Any]]) -> None:
+    """用控制台提交的完整 provider 列表替换 providers 配置。"""
+    existing = {p["name"]: p for p in _provider_entries(raw)}
+    providers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for item in submitted:
+        if not isinstance(item, dict):
+            raise ValueError("providers 数组中的条目必须是对象")
+        name = str(item.get("name") or "").strip()
+        if not name:
+            raise ValueError("provider 缺少 name")
+        if name in seen:
+            raise ValueError(f"provider 名称重复: {name!r}")
+        seen.add(name)
+
+        provider = dict(existing.get(name, {}))
+        provider["name"] = name
+        for key in ("enabled", "passthrough_unknown", "web_search", "web_search_enabled"):
+            if key in item:
+                provider[key] = bool(item[key])
+        if "weight" in item:
+            try:
+                provider["weight"] = float(item["weight"])
+            except (TypeError, ValueError):
+                raise ValueError(f"provider {name!r} 的 weight 必须为数字")
+            if provider["weight"] < 0:
+                raise ValueError(f"provider {name!r} 的 weight 不能为负数")
+        for key in ("outbound", "base_url", "path", "api_key_env"):
+            if key in item:
+                value = str(item.get(key) or "").strip()
+                if value:
+                    provider[key] = value
+                else:
+                    provider.pop(key, None)
+        if item.get("api_key"):
+            provider["api_key"] = str(item["api_key"]).strip()
+        if "timeout" in item and item.get("timeout") not in (None, ""):
+            try:
+                provider["timeout"] = float(item["timeout"])
+            except (TypeError, ValueError):
+                raise ValueError(f"provider {name!r} 的 timeout 必须为数字")
+        if "model_items" in item:
+            provider["models"] = _clean_model_items(item["model_items"], provider.get("models"))
+        elif "models" in item:
+            provider["models"] = _clean_model_items(item["models"], provider.get("models"))
+
+        providers.append(provider)
+
+    raw["providers"] = providers
+    raw.pop("model_map", None)
+
+
+def update_provider_controls(config_path: str, updates: list[dict[str, Any]]) -> None:
+    """更新 provider 配置。
+
+    兼容旧请求: 只包含 name/enabled/weight 时仅局部更新;
+    新控制台提交完整 provider 列表时,支持新增、删除与模型上下文窗口编辑。
+    """
+    raw = _read_config_raw(config_path)
+    if _is_control_only_update(updates):
+        _update_provider_controls_only(raw, updates)
+    else:
+        _replace_providers(raw, updates)
+    _atomic_write_verified(config_path, raw)
 
 
 ADMIN_HTML = """<!doctype html>
@@ -130,391 +385,207 @@ ADMIN_HTML = """<!doctype html>
   <style>
     :root {
       color-scheme: light;
-      --bg: #f4f6f8;
-      --bg-soft: #e9edf2;
+      --bg: #f5f7f9;
       --panel: #ffffff;
-      --panel-2: #f9fbfc;
-      --line: #d7dde5;
-      --line-strong: #c5ced9;
-      --text: #17202c;
-      --muted: #627084;
-      --soft-text: #354255;
-      --accent: #11826f;
-      --accent-2: #2f6fed;
-      --accent-dark: #0a6657;
-      --danger: #b13a3a;
-      --warning: #a26b07;
-      --ok: #0b7a59;
-      --shadow: 0 18px 45px rgba(20, 32, 46, 0.10);
-      --focus: 0 0 0 3px rgba(17, 130, 111, 0.20);
+      --panel-soft: #f0f4f7;
+      --line: #d6dee7;
+      --line-strong: #aebccc;
+      --text: #16202b;
+      --muted: #667487;
+      --accent: #0d806c;
+      --accent-2: #356fe8;
+      --danger: #b33b3b;
+      --ok: #087a58;
+      --warn: #94650c;
+      --shadow: 0 14px 38px rgba(20, 32, 46, 0.09);
+      --focus: 0 0 0 3px rgba(13, 128, 108, 0.22);
     }
     @media (prefers-color-scheme: dark) {
       :root {
         color-scheme: dark;
-        --bg: #10151d;
-        --bg-soft: #151c26;
-        --panel: #19212c;
-        --panel-2: #141b24;
-        --line: #2a3544;
-        --line-strong: #3a485a;
+        --bg: #111820;
+        --panel: #19222d;
+        --panel-soft: #121a23;
+        --line: #2b3948;
+        --line-strong: #43566b;
         --text: #edf3f8;
-        --muted: #9ba9b9;
-        --soft-text: #c8d2dd;
-        --accent: #43c6a9;
-        --accent-2: #7aa7ff;
-        --accent-dark: #2ca88f;
-        --danger: #ff7f7f;
-        --warning: #f0bd64;
-        --ok: #58d5a9;
-        --shadow: 0 18px 45px rgba(0, 0, 0, 0.32);
-        --focus: 0 0 0 3px rgba(67, 198, 169, 0.24);
+        --muted: #a0adbb;
+        --accent: #46c6aa;
+        --accent-2: #7da4ff;
+        --danger: #ff8181;
+        --ok: #58d6aa;
+        --warn: #f0bf68;
+        --shadow: 0 14px 38px rgba(0, 0, 0, 0.28);
+        --focus: 0 0 0 3px rgba(70, 198, 170, 0.24);
       }
-    }
-    html[data-theme="light"] {
-      color-scheme: light;
-      --bg: #f4f6f8;
-      --bg-soft: #e9edf2;
-      --panel: #ffffff;
-      --panel-2: #f9fbfc;
-      --line: #d7dde5;
-      --line-strong: #c5ced9;
-      --text: #17202c;
-      --muted: #627084;
-      --soft-text: #354255;
-      --accent: #11826f;
-      --accent-2: #2f6fed;
-      --accent-dark: #0a6657;
-      --danger: #b13a3a;
-      --warning: #a26b07;
-      --ok: #0b7a59;
-      --shadow: 0 18px 45px rgba(20, 32, 46, 0.10);
-      --focus: 0 0 0 3px rgba(17, 130, 111, 0.20);
-    }
-    html[data-theme="dark"] {
-      color-scheme: dark;
-      --bg: #10151d;
-      --bg-soft: #151c26;
-      --panel: #19212c;
-      --panel-2: #141b24;
-      --line: #2a3544;
-      --line-strong: #3a485a;
-      --text: #edf3f8;
-      --muted: #9ba9b9;
-      --soft-text: #c8d2dd;
-      --accent: #43c6a9;
-      --accent-2: #7aa7ff;
-      --accent-dark: #2ca88f;
-      --danger: #ff7f7f;
-      --warning: #f0bd64;
-      --ok: #58d5a9;
-      --shadow: 0 18px 45px rgba(0, 0, 0, 0.32);
-      --focus: 0 0 0 3px rgba(67, 198, 169, 0.24);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      background:
-        radial-gradient(circle at 18% 0%, rgba(47, 111, 237, 0.11), transparent 30%),
-        linear-gradient(180deg, var(--bg-soft), var(--bg) 260px);
+      background: var(--bg);
       color: var(--text);
       font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     header {
-      padding: 20px 24px 0;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: 0 1px 0 rgba(20, 32, 46, 0.02);
     }
     .topbar {
-      max-width: 1180px;
+      max-width: 1360px;
       margin: 0 auto;
+      padding: 16px 22px;
       display: flex;
-      align-items: center;
       justify-content: space-between;
-      gap: 20px;
-      padding: 16px 0 20px;
-      border-bottom: 1px solid var(--line);
+      align-items: center;
+      gap: 16px;
     }
-    .brand {
+    h1 { margin: 0; font-size: 21px; letter-spacing: 0; }
+    .subtitle { margin-top: 2px; color: var(--muted); }
+    main { max-width: 1360px; margin: 0 auto; padding: 18px 22px 36px; }
+    .toolbar, .inline-actions, .model-actions {
       display: flex;
       align-items: center;
-      gap: 12px;
-      min-width: 0;
-    }
-    .mark {
-      width: 42px;
-      height: 42px;
-      border-radius: 10px;
-      display: grid;
-      place-items: center;
-      color: #fff;
-      font-weight: 800;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2));
-      box-shadow: 0 12px 28px rgba(17, 130, 111, 0.22);
-      flex: 0 0 auto;
-    }
-    h1 { margin: 0; font-size: 22px; font-weight: 720; letter-spacing: 0; }
-    .subtitle { color: var(--muted); margin-top: 2px; }
-    main { max-width: 1180px; margin: 0 auto; padding: 22px 24px 34px; }
-    .toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 10px;
+      gap: 8px;
       flex-wrap: wrap;
     }
     button {
+      min-height: 34px;
       border: 1px solid var(--line);
       border-radius: 7px;
+      padding: 0 11px;
       background: var(--panel);
       color: var(--text);
-      min-height: 36px;
-      padding: 0 13px;
       font: inherit;
       cursor: pointer;
-      transition: border-color .16s ease, background .16s ease, transform .16s ease;
     }
-    button:hover { border-color: var(--line-strong); transform: translateY(-1px); }
-    button:focus-visible, input:focus-visible { outline: none; box-shadow: var(--focus); }
-    button.primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-      font-weight: 600;
+    button:hover { border-color: var(--line-strong); }
+    button:focus-visible, input:focus-visible, select:focus-visible {
+      outline: none;
+      box-shadow: var(--focus);
     }
-    button.primary:hover { background: var(--accent-dark); }
-    .theme-button { min-width: 92px; }
+    .primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 650; }
+    .danger { color: var(--danger); }
     .summary {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }
-    .metric {
-      background: color-mix(in srgb, var(--panel) 92%, transparent);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 14px 16px;
-      box-shadow: var(--shadow);
-    }
-    .metric-label { color: var(--muted); font-size: 12px; }
-    .metric-value { margin-top: 5px; font-size: 24px; font-weight: 760; }
-    .table-shell {
+    .metric, .section {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 10px;
-      overflow: hidden;
+      border-radius: 8px;
       box-shadow: var(--shadow);
     }
-    .table-shell + .table-shell { margin-top: 16px; }
-    .table-head {
+    .metric { padding: 13px 15px; }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .metric-value { margin-top: 4px; font-size: 24px; font-weight: 760; }
+    .section + .section { margin-top: 14px; }
+    .section-head {
       display: flex;
-      align-items: center;
       justify-content: space-between;
+      align-items: center;
       gap: 12px;
-      padding: 15px 16px;
+      padding: 13px 15px;
       border-bottom: 1px solid var(--line);
-      background: var(--panel-2);
+      background: var(--panel-soft);
     }
-    .table-title { font-weight: 700; }
+    .section-title { font-weight: 720; }
     #status { min-height: 20px; color: var(--muted); }
     #status.error { color: var(--danger); }
     #status.ok { color: var(--ok); }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 1040px; }
     th, td {
-      padding: 14px 16px;
+      padding: 11px 12px;
       text-align: left;
-      vertical-align: middle;
+      vertical-align: top;
       border-bottom: 1px solid var(--line);
     }
-    th {
+    th { color: var(--muted); font-size: 12px; font-weight: 650; background: var(--panel-soft); }
+    tr:last-child td { border-bottom: 0; }
+    input, select {
+      width: 100%;
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 9px;
+      background: var(--panel);
+      color: var(--text);
+      font: inherit;
+    }
+    input[type="checkbox"] { width: 18px; min-height: 18px; accent-color: var(--accent); }
+    .field-stack { display: grid; gap: 7px; min-width: 180px; }
+    .field-note { color: var(--muted); font-size: 12px; }
+    .provider-name { min-width: 150px; }
+    .endpoint { min-width: 260px; }
+    .number { max-width: 110px; }
+    .models-editor { display: grid; gap: 8px; min-width: 520px; }
+    .model-row {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) 128px 34px;
+      align-items: center;
+      gap: 7px;
+    }
+    .model-header {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) 128px 34px;
+      gap: 7px;
       color: var(--muted);
       font-size: 12px;
       font-weight: 650;
-      text-transform: uppercase;
-      background: color-mix(in srgb, var(--panel-2) 86%, var(--panel));
     }
-    tbody tr { transition: background .16s ease; }
-    tbody tr:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
-    tr:last-child td { border-bottom: 0; }
-    .provider-main {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      min-width: 220px;
+    .icon-button {
+      width: 34px;
+      padding: 0;
+      text-align: center;
+      font-weight: 760;
     }
-    .provider-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--muted);
-      box-shadow: 0 0 0 4px color-mix(in srgb, var(--muted) 16%, transparent);
-      flex: 0 0 auto;
-    }
-    tr.is-enabled .provider-dot {
-      background: var(--ok);
-      box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 18%, transparent);
-    }
-    .name { font-weight: 700; color: var(--text); }
-    .subtle { color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-all; }
     .pill {
       display: inline-flex;
       align-items: center;
       min-height: 24px;
-      padding: 0 9px;
-      border-radius: 999px;
+      padding: 0 8px;
       border: 1px solid var(--line);
-      background: var(--panel-2);
-      color: var(--soft-text);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--panel);
       font-size: 12px;
       font-weight: 650;
       white-space: nowrap;
     }
-    .pill.on {
-      color: var(--ok);
-      border-color: color-mix(in srgb, var(--ok) 30%, var(--line));
-      background: color-mix(in srgb, var(--ok) 10%, var(--panel));
-    }
-    .pill.off {
-      color: var(--warning);
-      border-color: color-mix(in srgb, var(--warning) 28%, var(--line));
-      background: color-mix(in srgb, var(--warning) 10%, var(--panel));
-    }
-    .models {
-      max-width: 420px;
-      color: var(--muted);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .route-cell {
-      min-width: 280px;
-    }
-    .route-stack {
-      display: grid;
-      gap: 8px;
-      min-width: 260px;
-    }
+    .pill.on { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 34%, var(--line)); }
+    .pill.off { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 32%, var(--line)); }
+    .route-stack { display: grid; gap: 7px; min-width: 280px; }
     .route-line {
       display: grid;
-      grid-template-columns: minmax(120px, 1fr) minmax(120px, 180px) 56px;
+      grid-template-columns: minmax(110px, 1fr) minmax(120px, 180px) 52px;
+      gap: 8px;
       align-items: center;
-      gap: 10px;
     }
-    .route-provider {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      color: var(--soft-text);
-      font-weight: 650;
-    }
-    .route-bar {
-      height: 8px;
-      border-radius: 999px;
-      background: var(--bg-soft);
-      overflow: hidden;
-      border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
-    }
-    .route-fill {
-      height: 100%;
-      border-radius: inherit;
-      background: linear-gradient(90deg, var(--accent), var(--accent-2));
-    }
-    .route-percent {
-      color: var(--text);
-      font-variant-numeric: tabular-nums;
-      text-align: right;
-    }
-    .route-note {
-      color: var(--muted);
-      font-size: 12px;
-    }
-    input[type="number"] {
-      width: 104px;
-      height: 34px;
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      padding: 0 8px;
-      font: inherit;
-      color: var(--text);
-      background: var(--panel-2);
-    }
-    label.switch {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      color: var(--soft-text);
-      white-space: nowrap;
-    }
-    .switch input {
-      appearance: none;
-      width: 42px;
-      height: 24px;
-      margin: 0;
-      border-radius: 999px;
-      border: 1px solid var(--line-strong);
-      background: var(--bg-soft);
-      position: relative;
-      cursor: pointer;
-      transition: background .18s ease, border-color .18s ease;
-    }
-    .switch input::after {
-      content: "";
-      position: absolute;
-      width: 18px;
-      height: 18px;
-      top: 2px;
-      left: 2px;
-      border-radius: 50%;
-      background: var(--panel);
-      box-shadow: 0 2px 7px rgba(0, 0, 0, .22);
-      transition: transform .18s ease;
-    }
-    .switch input:checked {
-      background: var(--accent);
-      border-color: var(--accent);
-    }
-    .switch input:checked::after { transform: translateX(18px); }
-    @media (max-width: 760px) {
-      header { padding: 14px 16px 0; }
+    .route-provider { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+    .route-bar { height: 8px; border-radius: 999px; background: var(--panel-soft); border: 1px solid var(--line); overflow: hidden; }
+    .route-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+    .route-percent { text-align: right; font-variant-numeric: tabular-nums; }
+    .empty { color: var(--muted); padding: 16px; }
+    @media (max-width: 820px) {
       .topbar { align-items: flex-start; flex-direction: column; }
-      .toolbar { width: 100%; justify-content: flex-start; }
-      main { padding: 16px; }
       .summary { grid-template-columns: 1fr; }
-      table, thead, tbody, th, td, tr { display: block; }
-      thead { display: none; }
-      tr { border-bottom: 1px solid var(--line); }
-      td { border-bottom: 0; padding: 9px 14px; }
-      td::before {
-        content: attr(data-label);
-        display: block;
-        color: var(--muted);
-        font-size: 12px;
-        margin-bottom: 3px;
-      }
-      .provider-main { min-width: 0; }
-      .models { max-width: none; }
-      .route-cell { min-width: 0; }
-      .route-stack { min-width: 0; }
-      .route-line { grid-template-columns: 1fr; gap: 5px; }
-      .route-percent { text-align: left; }
+      main { padding: 14px; }
     }
   </style>
 </head>
 <body>
   <header>
     <div class="topbar">
-      <div class="brand">
-        <div class="mark">LB</div>
-        <div>
-          <h1>codex-shift 控制台</h1>
-          <div class="subtitle">Provider 开关、权重和热加载</div>
-        </div>
+      <div>
+        <h1>codex-shift 控制台</h1>
+        <div class="subtitle">Provider、模型和上下文窗口热管理</div>
       </div>
       <div class="toolbar">
-        <button id="theme" class="theme-button" title="切换浅色/暗色模式">深色</button>
+        <button id="add-provider">新增 Provider</button>
         <button id="refresh">刷新</button>
         <button id="save" class="primary">保存并热加载</button>
       </div>
@@ -531,68 +602,68 @@ ADMIN_HTML = """<!doctype html>
         <div class="metric-value" id="metric-enabled">0</div>
       </div>
       <div class="metric">
-        <div class="metric-label">总权重</div>
-        <div class="metric-value" id="metric-weight">0</div>
+        <div class="metric-label">模型数</div>
+        <div class="metric-value" id="metric-models">0</div>
       </div>
     </section>
-    <section class="table-shell">
-      <div class="table-head">
-        <div class="table-title">Provider 路由池</div>
+    <section class="section">
+      <div class="section-head">
+        <div class="section-title">Provider 路由池</div>
         <div id="status"></div>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Provider</th>
-            <th>状态</th>
-            <th>启用</th>
-            <th>权重</th>
-            <th>协议</th>
-            <th>模型</th>
-          </tr>
-        </thead>
-        <tbody id="providers"></tbody>
-      </table>
-    </section>
-    <section class="table-shell">
-      <div class="table-head">
-        <div class="table-title">模型路由表</div>
-        <div class="route-note">根据当前开关与权重实时计算</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Provider</th>
+              <th>启用 Provider</th>
+              <th>权重</th>
+              <th>协议</th>
+              <th>上游</th>
+              <th>鉴权</th>
+              <th>模型与上下文窗口</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="providers"></tbody>
+        </table>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>模型</th>
-            <th>启用 Provider</th>
-            <th>总权重</th>
-            <th>路由概率</th>
-          </tr>
-        </thead>
-        <tbody id="routes"></tbody>
-      </table>
+    </section>
+    <section class="section">
+      <div class="section-head">
+        <div class="section-title">模型路由表</div>
+        <div class="field-note">根据当前编辑状态实时计算</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>启用 Provider</th>
+              <th>总权重</th>
+              <th>路由概率</th>
+            </tr>
+          </thead>
+          <tbody id="routes"></tbody>
+        </table>
+      </div>
     </section>
   </main>
   <script>
     const tbody = document.getElementById("providers");
     const routesBody = document.getElementById("routes");
     const statusEl = document.getElementById("status");
-    const themeButton = document.getElementById("theme");
     const totals = {
       total: document.getElementById("metric-total"),
       enabled: document.getElementById("metric-enabled"),
-      weight: document.getElementById("metric-weight"),
+      models: document.getElementById("metric-models"),
     };
+    let providers = [];
 
-    function preferredTheme() {
-      const saved = localStorage.getItem("codex_shift_theme");
-      if (saved) return saved;
-      return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-    }
-
-    function applyTheme(theme) {
-      document.documentElement.dataset.theme = theme;
-      themeButton.textContent = theme === "dark" ? "浅色" : "深色";
-      localStorage.setItem("codex_shift_theme", theme);
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[ch]));
     }
 
     function setStatus(text, error = false) {
@@ -600,21 +671,70 @@ ADMIN_HTML = """<!doctype html>
       statusEl.className = error ? "error" : (text.includes("成功") ? "ok" : "");
     }
 
-    function updateMetrics(providers) {
+    function normalizeProvider(p = {}) {
+      const modelItems = Array.isArray(p.model_items) && p.model_items.length
+        ? p.model_items
+        : (p.models || []).map((name) => ({name, mapped_model: name, context_window: ""}));
+      return {
+        name: p.name || nextProviderName(),
+        enabled: p.enabled !== false,
+        weight: Number(p.weight ?? 1),
+        outbound: p.outbound || "chat_completions",
+        base_url: p.base_url || "",
+        path: p.path || "",
+        api_key_env: p.api_key_env || "",
+        api_key: "",
+        api_key_set: Boolean(p.api_key_set),
+        timeout: Number(p.timeout ?? 300),
+        passthrough_unknown: p.passthrough_unknown !== false,
+        web_search: Boolean(p.web_search),
+        web_search_enabled: Boolean(p.web_search_enabled),
+        model_items: modelItems.map((m) => ({
+          name: m.name || "",
+          mapped_model: m.mapped_model || m.name || "",
+          context_window: m.context_window ?? "",
+        })),
+      };
+    }
+
+    function nextProviderName() {
+      let idx = providers.length + 1;
+      let name = `provider_${idx}`;
+      const names = new Set(providers.map((p) => p.name));
+      while (names.has(name)) name = `provider_${++idx}`;
+      return name;
+    }
+
+    function providerModelNames(provider) {
+      return (provider.model_items || [])
+        .map((m) => String(m.name || "").trim())
+        .filter(Boolean);
+    }
+
+    function providerMappedModel(provider, inboundModel) {
+      const item = (provider.model_items || []).find((m) => String(m.name || "").trim() === inboundModel);
+      return String(item?.mapped_model || inboundModel).trim() || inboundModel;
+    }
+
+    function updateMetrics() {
       const enabled = providers.filter((p) => p.enabled);
+      const modelNames = new Set();
+      for (const provider of providers) {
+        for (const name of providerModelNames(provider)) modelNames.add(name);
+      }
       totals.total.textContent = providers.length;
       totals.enabled.textContent = enabled.length;
-      totals.weight.textContent = enabled.reduce((sum, p) => sum + Number(p.weight || 0), 0).toFixed(1).replace(/\\.0$/, "");
+      totals.models.textContent = modelNames.size;
     }
 
     function formatNumber(value) {
       return Number(value || 0).toFixed(1).replace(/\\.0$/, "");
     }
 
-    function routeRows(providers) {
+    function routeRows() {
       const models = new Map();
       for (const provider of providers) {
-        for (const model of provider.models || []) {
+        for (const model of providerModelNames(provider)) {
           if (!models.has(model)) models.set(model, []);
           models.get(model).push(provider);
         }
@@ -625,114 +745,160 @@ ADMIN_HTML = """<!doctype html>
           const active = candidates.filter((p) => p.enabled);
           const positive = active.filter((p) => Number(p.weight || 0) > 0);
           const totalWeight = positive.reduce((sum, p) => sum + Number(p.weight || 0), 0);
-          return { model, active, positive, totalWeight };
+          return {model, active, totalWeight};
         });
     }
 
-    function renderRoutes(providers) {
+    function renderRoutes() {
       routesBody.innerHTML = "";
-      const rows = routeRows(providers);
+      const rows = routeRows();
       if (!rows.length) {
-        routesBody.innerHTML = `<tr><td data-label="模型" colspan="4" class="route-note">暂无模型</td></tr>`;
+        routesBody.innerHTML = `<tr><td colspan="4" class="empty">暂无模型</td></tr>`;
         return;
       }
       for (const row of rows) {
-        const tr = document.createElement("tr");
-        const providerCount = row.active.length;
         const fallbackProvider = row.active[0]?.name;
         const routeHtml = row.active.length
           ? row.active.map((p) => {
               let probability = 0;
-              if (p.enabled && row.totalWeight > 0) {
+              if (row.totalWeight > 0) {
                 probability = Number(p.weight || 0) > 0 ? Number(p.weight || 0) / row.totalWeight * 100 : 0;
-              } else if (p.enabled && row.totalWeight <= 0 && p.name === fallbackProvider) {
+              } else if (p.name === fallbackProvider) {
                 probability = 100;
               }
               return `
                 <div class="route-line">
-                  <div class="route-provider" title="${p.name}">${p.name}</div>
-                  <div class="route-bar" aria-hidden="true"><div class="route-fill" style="width: ${probability}%"></div></div>
+                  <div class="route-provider" title="${esc(p.name)} -> ${esc(providerMappedModel(p, row.model))}">
+                    ${esc(p.name)} -> ${esc(providerMappedModel(p, row.model))}
+                  </div>
+                  <div class="route-bar" aria-hidden="true"><div class="route-fill" style="width:${probability}%"></div></div>
                   <div class="route-percent">${probability.toFixed(1).replace(/\\.0$/, "")}%</div>
                 </div>
               `;
             }).join("")
-          : `<div class="route-note">无启用 provider</div>`;
+          : `<div class="field-note">无启用 provider</div>`;
+        const tr = document.createElement("tr");
         tr.innerHTML = `
-          <td data-label="模型"><div class="name">${row.model}</div></td>
-          <td data-label="启用 Provider"><span class="pill ${providerCount ? "on" : "off"}">${providerCount}</span></td>
-          <td data-label="总权重">${formatNumber(row.totalWeight)}</td>
-          <td data-label="路由概率" class="route-cell"><div class="route-stack">${routeHtml}</div></td>
+          <td><strong>${esc(row.model)}</strong></td>
+          <td><span class="pill ${row.active.length ? "on" : "off"}">${row.active.length}</span></td>
+          <td>${formatNumber(row.totalWeight)}</td>
+          <td><div class="route-stack">${routeHtml}</div></td>
         `;
         routesBody.appendChild(tr);
       }
     }
 
-    function render(providers) {
+    function renderModels(provider, providerIndex) {
+      const rows = provider.model_items.map((model, modelIndex) => `
+        <div class="model-row">
+          <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="name"
+                 value="${esc(model.name)}" placeholder="入站模型">
+          <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="mapped_model"
+                 value="${esc(model.mapped_model || model.name)}" placeholder="出站模型">
+          <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="context_window"
+                 value="${esc(model.context_window)}" inputmode="numeric" placeholder="context_window">
+          <button class="icon-button danger" data-action="delete-model" data-provider="${providerIndex}" data-model="${modelIndex}" title="删除模型">×</button>
+        </div>
+      `).join("");
+      return `
+        <div class="models-editor">
+          <div class="model-header"><span>入站模型</span><span>出站模型</span><span>上下文窗口</span><span></span></div>
+          ${rows || `<div class="field-note">暂无模型</div>`}
+          <div class="model-actions">
+            <button data-action="add-model" data-provider="${providerIndex}">添加模型</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderProviders() {
       tbody.innerHTML = "";
-      updateMetrics(providers);
-      renderRoutes(providers);
-      for (const p of providers) {
+      if (!providers.length) {
+        tbody.innerHTML = `<tr><td colspan="8" class="empty">暂无 provider，请先新增。</td></tr>`;
+        return;
+      }
+      providers.forEach((p, index) => {
         const tr = document.createElement("tr");
-        tr.dataset.name = p.name;
-        tr.className = p.enabled ? "is-enabled" : "";
         tr.innerHTML = `
-          <td data-label="Provider">
-            <div class="provider-main">
-              <span class="provider-dot"></span>
-              <div>
-                <div class="name">${p.name}</div>
-                <div class="subtle">${p.base_url}${p.path}</div>
-              </div>
+          <td>
+            <div class="field-stack provider-name">
+              <input data-provider="${index}" data-field="name" value="${esc(p.name)}" placeholder="provider name">
+              <span class="field-note">${p.enabled ? "运行中" : "已停用"}</span>
             </div>
           </td>
-          <td data-label="状态">
-            <span class="pill ${p.enabled ? "on" : "off"}">${p.enabled ? "运行中" : "已停用"}</span>
+          <td><input type="checkbox" data-provider="${index}" data-field="enabled" ${p.enabled ? "checked" : ""}></td>
+          <td><input class="number" type="number" min="0" step="0.1" data-provider="${index}" data-field="weight" value="${esc(p.weight)}"></td>
+          <td>
+            <select data-provider="${index}" data-field="outbound">
+              <option value="chat_completions" ${p.outbound === "chat_completions" ? "selected" : ""}>chat_completions</option>
+              <option value="responses" ${p.outbound === "responses" ? "selected" : ""}>responses</option>
+            </select>
           </td>
-          <td data-label="启用">
-            <label class="switch"><input type="checkbox" class="enabled" ${p.enabled ? "checked" : ""}><span>${p.enabled ? "开启" : "关闭"}</span></label>
+          <td>
+            <div class="field-stack endpoint">
+              <input data-provider="${index}" data-field="base_url" value="${esc(p.base_url)}" placeholder="https://api.example.com">
+              <input data-provider="${index}" data-field="path" value="${esc(p.path)}" placeholder="path, 可留空使用默认">
+            </div>
           </td>
-          <td data-label="权重">
-            <input type="number" class="weight" min="0" step="0.1" value="${p.weight}">
+          <td>
+            <div class="field-stack">
+              <input data-provider="${index}" data-field="api_key_env" value="${esc(p.api_key_env)}" placeholder="API_KEY_ENV">
+              <input data-provider="${index}" data-field="api_key" value="" placeholder="${p.api_key_set ? "已设置，留空保留" : "直接 API Key，可留空"}">
+            </div>
           </td>
-          <td data-label="协议"><span class="pill">${p.outbound}</span></td>
-          <td data-label="模型" class="models">${(p.models || []).join(", ") || "(兜底)"}</td>
+          <td>${renderModels(p, index)}</td>
+          <td>
+            <div class="inline-actions">
+              <button class="danger" data-action="delete-provider" data-provider="${index}">删除</button>
+            </div>
+          </td>
         `;
-        const checkbox = tr.querySelector(".enabled");
-        const labelText = tr.querySelector(".switch span");
-        checkbox.addEventListener("change", () => {
-          tr.className = checkbox.checked ? "is-enabled" : "";
-          labelText.textContent = checkbox.checked ? "开启" : "关闭";
-          tr.querySelector(".pill").className = `pill ${checkbox.checked ? "on" : "off"}`;
-          tr.querySelector(".pill").textContent = checkbox.checked ? "运行中" : "已停用";
-          const current = [...tbody.querySelectorAll("tr")].map(readRow);
-          updateMetrics(current);
-          renderRoutes(mergeControls(current));
-        });
-        tr.querySelector(".weight").addEventListener("input", () => {
-          const current = [...tbody.querySelectorAll("tr")].map(readRow);
-          updateMetrics(current);
-          renderRoutes(mergeControls(current));
-        });
         tbody.appendChild(tr);
+      });
+    }
+
+    function render() {
+      updateMetrics();
+      renderProviders();
+      renderRoutes();
+    }
+
+    function updateStateFromInput(target) {
+      const pIndex = Number(target.dataset.provider);
+      if (!Number.isInteger(pIndex) || !providers[pIndex]) return;
+      const field = target.dataset.field;
+      const mIndex = target.dataset.model !== undefined ? Number(target.dataset.model) : null;
+      let value = target.type === "checkbox" ? target.checked : target.value;
+      if (field === "weight" || field === "timeout") value = Number(value || 0);
+      if (mIndex !== null && Number.isInteger(mIndex)) {
+        providers[pIndex].model_items[mIndex][field] = value;
+      } else {
+        providers[pIndex][field] = value;
       }
+      updateMetrics();
+      renderRoutes();
     }
 
-    let loadedProviders = [];
-
-    function mergeControls(controls) {
-      const byName = new Map(controls.map((p) => [p.name, p]));
-      return loadedProviders.map((provider) => ({
-        ...provider,
-        ...(byName.get(provider.name) || {}),
+    function payloadProviders() {
+      return providers.map((p) => ({
+        name: String(p.name || "").trim(),
+        enabled: Boolean(p.enabled),
+        weight: Number(p.weight || 0),
+        outbound: p.outbound,
+        base_url: String(p.base_url || "").trim(),
+        path: String(p.path || "").trim(),
+        api_key_env: String(p.api_key_env || "").trim(),
+        api_key: String(p.api_key || "").trim(),
+        timeout: Number(p.timeout || 300),
+        passthrough_unknown: Boolean(p.passthrough_unknown),
+        web_search: Boolean(p.web_search),
+        web_search_enabled: Boolean(p.web_search_enabled),
+        model_items: (p.model_items || []).map((m) => ({
+          name: String(m.name || "").trim(),
+          mapped_model: String(m.mapped_model || m.name || "").trim(),
+          context_window: String(m.context_window ?? "").trim(),
+        })).filter((m) => m.name),
       }));
-    }
-
-    function readRow(tr) {
-      return {
-        name: tr.dataset.name,
-        enabled: tr.querySelector(".enabled").checked,
-        weight: Number(tr.querySelector(".weight").value),
-      };
     }
 
     async function load() {
@@ -740,33 +906,57 @@ ADMIN_HTML = """<!doctype html>
       const resp = await fetch("/admin/api/config");
       if (!resp.ok) throw new Error(await resp.text());
       const data = await resp.json();
-      loadedProviders = data.providers;
-      render(data.providers);
-      setStatus(`已加载 ${data.providers.length} 个 provider`);
+      providers = (data.providers || []).map(normalizeProvider);
+      render();
+      setStatus(`已加载 ${providers.length} 个 provider`);
     }
 
     async function save() {
-      const providers = [...tbody.querySelectorAll("tr")].map(readRow);
       setStatus("正在保存并热加载...");
       const resp = await fetch("/admin/api/config", {
         method: "POST",
         headers: {"content-type": "application/json"},
-        body: JSON.stringify({providers}),
+        body: JSON.stringify({providers: payloadProviders()}),
       });
       if (!resp.ok) {
         const data = await resp.json().catch(() => ({}));
         throw new Error(data.error?.message || await resp.text());
       }
       const data = await resp.json();
-      loadedProviders = data.providers;
-      render(data.providers);
+      providers = (data.providers || []).map(normalizeProvider);
+      render();
       setStatus("保存成功, 新配置已生效");
     }
 
-    applyTheme(preferredTheme());
-    themeButton.addEventListener("click", () => {
-      const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-      applyTheme(next);
+    tbody.addEventListener("input", (event) => updateStateFromInput(event.target));
+    tbody.addEventListener("change", (event) => updateStateFromInput(event.target));
+    tbody.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) return;
+      const pIndex = Number(button.dataset.provider);
+      const mIndex = Number(button.dataset.model);
+      if (button.dataset.action === "delete-provider") {
+        providers.splice(pIndex, 1);
+      } else if (button.dataset.action === "add-model") {
+        providers[pIndex].model_items.push({name: "", mapped_model: "", context_window: ""});
+      } else if (button.dataset.action === "delete-model") {
+        providers[pIndex].model_items.splice(mIndex, 1);
+      }
+      render();
+    });
+
+    document.getElementById("add-provider").addEventListener("click", () => {
+      providers.push(normalizeProvider({
+        name: nextProviderName(),
+        enabled: false,
+        weight: 1,
+        outbound: "chat_completions",
+        base_url: "",
+        path: "",
+        api_key_env: "",
+        model_items: [{name: "", mapped_model: "", context_window: ""}],
+      }));
+      render();
     });
     document.getElementById("refresh").addEventListener("click", () => load().catch((e) => setStatus(e.message, true)));
     document.getElementById("save").addEventListener("click", () => save().catch((e) => setStatus(e.message, true)));

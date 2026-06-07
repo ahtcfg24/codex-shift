@@ -5,18 +5,11 @@ server:
   host: 127.0.0.1
   port: 8080
 
-# 全局模型映射(可选): 入站 model 名 -> 出站(实际)model 名。
-# 路由以"映射后的值"进行;映射后的值需出现在某个 provider 的 models 中。
-# 例: gpt-5.5 与 gpt-5.4-mini 都映射到 deepseek-v4-pro,因此都会路由到 deepseek。
-model_map:
-  gpt-5.5: deepseek-v4-pro
-  gpt-5.4-mini: deepseek-v4-pro
-
 # 多 provider 配置: 可同时配置 deepseek / mimo / qwen / 内部 responses 网关等。
 # 路由规则:
-#   1. 入站 model 经 model_map 映射后作为唯一路由键;
-#   2. 命中启用 provider 的 models 列表则进入候选;
-#   3. 同一 model 可由多个 provider 提供,请求时按 provider weight 加权选择。
+#   1. 入站 model 直接匹配启用 provider 的 models[].name;
+#   2. 同一入站 model 可由多个 provider 提供,请求时按 provider weight 加权选择;
+#   3. 选中 provider 后,按该条 model 的 mapped_model 改写为上游真实模型名。
 # outbound、上游地址、鉴权、超时等均为 provider 级别配置。
 providers:
   - name: deepseek
@@ -30,11 +23,13 @@ providers:
     # 可选: 覆盖默认出站路径(chat 默认 /v1/chat/completions, responses 默认 /responses)。
     # path: /v1/chat/completions
     timeout: 300
-    # 该 provider 支持的(出站)model 列表,作为路由键。
+    # 该 provider 支持的入站 model 列表,作为路由键。
     # 条目可为字符串(仅 model 名),也可为对象以声明上下文窗口等元数据。
+    # mapped_model 可选: 当前 provider 实际出站 model 名;省略时默认与 name 相同。
     # 对象写法的元数据会通过 GET /models 暴露给 codex 等客户端,使其获得真实上下文长度。
     models:
-      - name: deepseek-v4-pro
+      - name: gpt-5.5                  # 入站模型名,也是 /models 暴露给 codex 的 slug
+        mapped_model: deepseek-v4-pro  # 出站模型名,实际发给 deepseek
         context_window: 1000000          # 上下文窗口(token);codex 据此计算可用上下文
         # max_context_window: 131072    # 可选;省略时与 context_window 一致
         # auto_compact_token_limit: 117964  # 可选;省略时 codex 取上下文的 90%
@@ -42,7 +37,7 @@ providers:
         # display_name: DeepSeek V4 Pro # 可选;省略时回退为 slug
         # description: DeepSeek coding model  # 可选;/models 展示描述
         # base_instructions: ""         # 可选;覆盖该模型的 codex 系统提示词
-      - deepseek-v4-flash               # 字符串写法:不暴露上下文窗口元数据
+      - deepseek-v4-flash               # 字符串写法:入站/出站同名,不暴露上下文窗口元数据
 
   - name: mimo
     enabled: true
@@ -69,7 +64,7 @@ providers:
     weight: 1
     # 出站协议 responses: 上游本身就是 OpenAI Responses 协议,代理只做"全透传"——
     # 请求体/响应体不做任何协议转换,仅注入 api_key(apikey 代理)并支持 /models 上下文代理。
-    # 仅当 model_map 配置了改名时才会改写请求体中的 model 字段,其余字段一字不动。
+    # 仅当 models[].mapped_model 配置了改名时才会改写请求体中的 model 字段,其余字段一字不动。
     outbound: responses
     # 默认出站路径为 /responses;上游 base_url 末尾常带 /v1,拼出 .../v1/responses。
     # 若 base_url 为根地址,可显式 path: /v1/responses。
@@ -78,6 +73,7 @@ providers:
     timeout: 300
     models:
       - name: gpt-5.5
+        # mapped_model: provider-specific-gpt-5.5
         context_window: 1050000
 
 defaults:

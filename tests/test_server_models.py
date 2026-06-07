@@ -9,14 +9,13 @@ from codex_shift.config import load_config
 from codex_shift.server import create_app
 
 _CONFIG = """
-    model_map:
-      gpt-5.5: deepseek-v4-pro
     providers:
       - name: deepseek
         outbound: chat_completions
         base_url: https://api.deepseek.com
         models:
-          - name: deepseek-v4-pro
+          - name: gpt-5.5
+            mapped_model: deepseek-v4-pro
             context_window: 131072
           - plain-no-context
 """
@@ -37,8 +36,8 @@ def test_models_endpoint(client, path):
     assert "etag" in resp.headers
     body = resp.json()
     slugs = {m["slug"] for m in body["models"]}
-    # 已配置上下文的模型与别名在目录中;无上下文的模型被跳过
-    assert slugs == {"deepseek-v4-pro", "gpt-5.5"}
+    # /models 暴露入站模型名;无上下文的模型被跳过
+    assert slugs == {"gpt-5.5"}
     assert "plain-no-context" not in slugs
 
 

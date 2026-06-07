@@ -113,3 +113,130 @@ def test_admin_rejects_invalid_weight_without_replacing_config(tmp_path):
     })
     assert resp.status_code == 400
     assert open(cfg_path, encoding="utf-8").read() == original
+
+
+def test_admin_rejects_empty_provider_list_without_replacing_config(tmp_path):
+    cfg_path = _write(tmp_path, """
+        providers:
+          - name: a
+            outbound: chat_completions
+            base_url: https://a.example.com
+            models: [m]
+    """)
+    original = open(cfg_path, encoding="utf-8").read()
+    client = TestClient(server.create_app(load_config(cfg_path), config_path=cfg_path))
+
+    resp = client.post("/admin/api/config", json={"providers": []})
+    assert resp.status_code == 400
+    assert "至少需要配置一个 provider" in resp.json()["error"]["message"]
+    assert open(cfg_path, encoding="utf-8").read() == original
+
+
+def test_admin_surfaces_legacy_global_model_map_and_removes_it_on_full_save(tmp_path):
+    cfg_path = _write(tmp_path, """
+        model_map:
+          gpt-5.5: deepseek-v4-pro
+        providers:
+          - name: deepseek
+            outbound: chat_completions
+            base_url: https://api.deepseek.com
+            models:
+              - name: deepseek-v4-pro
+                context_window: 1000000
+    """)
+    client = TestClient(server.create_app(load_config(cfg_path), config_path=cfg_path))
+
+    loaded = client.get("/admin/api/config").json()["providers"][0]
+    alias_item = next(m for m in loaded["model_items"] if m["name"] == "gpt-5.5")
+    assert alias_item["mapped_model"] == "deepseek-v4-pro"
+    assert alias_item["context_window"] == 1000000
+
+    saved = client.post("/admin/api/config", json={"providers": [
+        {
+            "name": "deepseek",
+            "enabled": True,
+            "weight": 1,
+            "outbound": "chat_completions",
+            "base_url": "https://api.deepseek.com",
+            "model_items": [
+                {"name": "gpt-5.5", "mapped_model": "deepseek-v4-pro", "context_window": 1000000}
+            ],
+        }
+    ]})
+    assert saved.status_code == 200
+
+    text = open(cfg_path, encoding="utf-8").read()
+    assert "model_map:" not in text
+    assert "name: gpt-5.5" in text
+    assert "mapped_model: deepseek-v4-pro" in text
+    cfg = load_config(cfg_path)
+    provider, mapped = cfg.resolve("gpt-5.5")
+    assert provider.name == "deepseek"
+    assert mapped == "deepseek-v4-pro"
+
+
+def test_admin_can_edit_models_and_add_delete_providers(tmp_path):
+    cfg_path = _write(tmp_path, """
+        providers:
+          - name: old
+            outbound: chat_completions
+            base_url: https://old.example.com
+            models:
+              - name: old-model
+                context_window: 1000
+          - name: keep
+            outbound: responses
+            base_url: https://keep.example.com/v1
+            models:
+              - name: shared
+                mapped_model: upstream-shared
+                context_window: 2000
+    """)
+    client = TestClient(server.create_app(load_config(cfg_path), config_path=cfg_path))
+
+    loaded = client.get("/admin/api/config").json()["providers"]
+    keep = next(p for p in loaded if p["name"] == "keep")
+    assert keep["model_items"][0]["mapped_model"] == "upstream-shared"
+    keep["model_items"] = [
+        {"name": "shared", "mapped_model": "upstream-shared-v2", "context_window": 4096},
+        {"name": "new-model", "context_window": 8192},
+    ]
+    added = {
+        "name": "added",
+        "enabled": True,
+        "weight": 2,
+        "outbound": "chat_completions",
+        "base_url": "https://added.example.com",
+        "path": "/v1/chat/completions",
+        "api_key_env": "ADDED_API_KEY",
+        "model_items": [
+            {"name": "added-model", "mapped_model": "provider-added-model", "context_window": 16384}
+        ],
+    }
+
+    saved = client.post("/admin/api/config", json={"providers": [keep, added]})
+    assert saved.status_code == 200
+    providers = saved.json()["providers"]
+    assert [p["name"] for p in providers] == ["keep", "added"]
+
+    cfg = load_config(cfg_path)
+    assert [p.name for p in cfg.providers] == ["keep", "added"]
+    assert cfg.providers[0].model_meta["shared"].context_window == 4096
+    assert cfg.providers[0].model_meta["new-model"].context_window == 8192
+    assert cfg.providers[0].model_map["shared"] == "upstream-shared-v2"
+    assert cfg.providers[0].model_map["new-model"] == "new-model"
+    assert cfg.providers[1].model_map["added-model"] == "provider-added-model"
+    assert "api_key_env: ADDED_API_KEY" in open(cfg_path, encoding="utf-8").read()
+    assert "mapped_model: upstream-shared-v2" in open(cfg_path, encoding="utf-8").read()
+    assert "mapped_model: provider-added-model" in open(cfg_path, encoding="utf-8").read()
+
+    catalog = client.get("/models").json()
+    contexts = {m["slug"]: m["context_window"] for m in catalog["models"]}
+    assert contexts == {
+        "shared": 4096,
+        "new-model": 8192,
+        "added-model": 16384,
+    }
+
+    health = client.get("/health").json()
+    assert [p["name"] for p in health["providers"]] == ["keep", "added"]

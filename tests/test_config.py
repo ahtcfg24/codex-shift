@@ -49,6 +49,37 @@ def test_multi_provider_routing(tmp_path):
     assert p3.outbound == "responses"
 
 
+def test_provider_scoped_model_mapping_routes_by_inbound_model(tmp_path):
+    """models[].name 是入站路由键,mapped_model 是该 provider 的出站模型名。"""
+    cfg = _write(tmp_path, """
+        providers:
+          - name: deepseek
+            outbound: chat_completions
+            base_url: https://api.deepseek.com
+            models:
+              - name: gpt-5.5
+                mapped_model: deepseek-v4-pro
+                context_window: 1000000
+          - name: mimo
+            outbound: chat_completions
+            base_url: https://api.mimo.example.com
+            weight: 0
+            models:
+              - name: gpt-5.5
+                mapped_model: mimo-v2.5-pro
+                context_window: 1000000
+    """)
+    c = load_config(cfg)
+    assert c.providers[0].models == ["gpt-5.5"]
+    assert c.providers[0].model_map["gpt-5.5"] == "deepseek-v4-pro"
+    assert c.providers[1].model_map["gpt-5.5"] == "mimo-v2.5-pro"
+    assert [p.name for p in c._model_index["gpt-5.5"]] == ["deepseek", "mimo"]
+
+    provider, mapped = c.resolve("gpt-5.5")
+    assert provider.name == "deepseek"
+    assert mapped == "deepseek-v4-pro"
+
+
 def test_unroutable_model_returns_none(tmp_path):
     """无匹配 provider 时返回 (None, 映射后名)。"""
     cfg = _write(tmp_path, """
