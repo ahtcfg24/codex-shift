@@ -428,6 +428,9 @@ ADMIN_HTML = """<!doctype html>
       font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
       border-bottom: 1px solid var(--line);
       background: var(--panel);
       box-shadow: 0 1px 0 rgba(20, 32, 46, 0.02);
@@ -467,21 +470,12 @@ ADMIN_HTML = """<!doctype html>
     }
     .primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 650; }
     .danger { color: var(--danger); }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-      margin-bottom: 14px;
-    }
-    .metric, .section {
+    .section {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
       box-shadow: var(--shadow);
     }
-    .metric { padding: 13px 15px; }
-    .metric-label { color: var(--muted); font-size: 12px; }
-    .metric-value { margin-top: 4px; font-size: 24px; font-weight: 760; }
     .section + .section { margin-top: 14px; }
     .section-head {
       display: flex;
@@ -572,7 +566,6 @@ ADMIN_HTML = """<!doctype html>
     .empty { color: var(--muted); padding: 16px; }
     @media (max-width: 820px) {
       .topbar { align-items: flex-start; flex-direction: column; }
-      .summary { grid-template-columns: 1fr; }
       main { padding: 14px; }
     }
   </style>
@@ -592,20 +585,6 @@ ADMIN_HTML = """<!doctype html>
     </div>
   </header>
   <main>
-    <section class="summary" aria-label="Provider 概览">
-      <div class="metric">
-        <div class="metric-label">总数</div>
-        <div class="metric-value" id="metric-total">0</div>
-      </div>
-      <div class="metric">
-        <div class="metric-label">已启用</div>
-        <div class="metric-value" id="metric-enabled">0</div>
-      </div>
-      <div class="metric">
-        <div class="metric-label">模型数</div>
-        <div class="metric-value" id="metric-models">0</div>
-      </div>
-    </section>
     <section class="section">
       <div class="section-head">
         <div class="section-title">Provider 路由池</div>
@@ -653,11 +632,6 @@ ADMIN_HTML = """<!doctype html>
     const tbody = document.getElementById("providers");
     const routesBody = document.getElementById("routes");
     const statusEl = document.getElementById("status");
-    const totals = {
-      total: document.getElementById("metric-total"),
-      enabled: document.getElementById("metric-enabled"),
-      models: document.getElementById("metric-models"),
-    };
     let providers = [];
 
     function esc(value) {
@@ -714,17 +688,6 @@ ADMIN_HTML = """<!doctype html>
     function providerMappedModel(provider, inboundModel) {
       const item = (provider.model_items || []).find((m) => String(m.name || "").trim() === inboundModel);
       return String(item?.mapped_model || inboundModel).trim() || inboundModel;
-    }
-
-    function updateMetrics() {
-      const enabled = providers.filter((p) => p.enabled);
-      const modelNames = new Set();
-      for (const provider of providers) {
-        for (const name of providerModelNames(provider)) modelNames.add(name);
-      }
-      totals.total.textContent = providers.length;
-      totals.enabled.textContent = enabled.length;
-      totals.models.textContent = modelNames.size;
     }
 
     function formatNumber(value) {
@@ -858,7 +821,6 @@ ADMIN_HTML = """<!doctype html>
     }
 
     function render() {
-      updateMetrics();
       renderProviders();
       renderRoutes();
     }
@@ -875,7 +837,6 @@ ADMIN_HTML = """<!doctype html>
       } else {
         providers[pIndex][field] = value;
       }
-      updateMetrics();
       renderRoutes();
     }
 

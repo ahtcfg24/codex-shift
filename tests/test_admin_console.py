@@ -34,6 +34,9 @@ def test_admin_lists_all_providers_and_html(tmp_path):
     page = client.get("/admin")
     assert page.status_code == 200
     assert "codex-shift 控制台" in page.text
+    assert "position: sticky" in page.text
+    assert "Provider 概览" not in page.text
+    assert "metric-total" not in page.text
     assert "模型路由表" in page.text
     assert "启用 Provider" in page.text
     assert "renderRoutes" in page.text
