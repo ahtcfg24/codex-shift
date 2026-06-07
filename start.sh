@@ -277,6 +277,7 @@ done
 
 if [ "$ready" = "1" ]; then
   echo "[start] 已就绪 PID=$NEWPID, 监听 http://$PROBE_HOST:$PORT"
+  echo "[start] 控制台: http://$PROBE_HOST:$PORT/admin"
   echo "[start] 查看日志: tail -f $LOG_FILE   停止: ./start.sh stop"
 else
   echo "[start] 启动失败或未就绪,最近日志:" >&2

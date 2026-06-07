@@ -35,7 +35,9 @@ def main(argv: list[str] | None = None) -> int:
 
     app = create_app(cfg, config_path=args.config)
     log = logging.getLogger("codex_shift")
+    admin_host = "127.0.0.1" if cfg.host == "0.0.0.0" else cfg.host
     log.info("启动: 监听 %s:%s, 已配置 %d 个 provider", cfg.host, cfg.port, len(cfg.providers))
+    log.info("控制台: http://%s:%s/admin", admin_host, cfg.port)
     for p in cfg.providers:
         log.info(
             "  provider=%s 出站=%s 上游=%s%s models=%s",
