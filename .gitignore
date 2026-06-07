@@ -1,0 +1,35 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Virtual environment ===
+.venv/
+venv/
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Runtime (local) ===
+.codex-shift.pid
+.codex-shift.log
+
+# === Sensitive config (contains real API keys) ===
+config.yaml
+.env
+
+# === Test cache ===
+.pytest_cache/
+.coverage
+htmlcov/

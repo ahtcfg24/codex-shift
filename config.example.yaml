@@ -1,0 +1,100 @@
+# codex-shift 配置示例：为 Codex 提供 Responses 协议适配
+# 复制为 config.yaml 后按需修改。
+
+server:
+  host: 127.0.0.1
+  port: 8080
+
+# 全局模型映射(可选): 入站 model 名 -> 出站(实际)model 名。
+# 路由以"映射后的值"进行;映射后的值需出现在某个 provider 的 models 中。
+# 例: gpt-5.5 与 gpt-5.4-mini 都映射到 deepseek-v4-pro,因此都会路由到 deepseek。
+model_map:
+  gpt-5.5: deepseek-v4-pro
+  gpt-5.4-mini: deepseek-v4-pro
+
+# 多 provider 配置: 可同时配置 deepseek / mimo / qwen / 内部 responses 网关等。
+# 路由规则:
+#   1. 入站 model 经 model_map 映射后作为唯一路由键;
+#   2. 命中启用 provider 的 models 列表则进入候选;
+#   3. 同一 model 可由多个 provider 提供,请求时按 provider weight 加权选择。
+# outbound、上游地址、鉴权、超时等均为 provider 级别配置。
+providers:
+  - name: deepseek
+    enabled: true
+    weight: 1
+    # 出站目标协议: chat_completions | responses
+    outbound: chat_completions
+    base_url: https://api.deepseek.com
+    # 直接写明 api_key,或用 api_key_env 从环境变量读取(api_key 优先)。
+    api_key_env: DEEPSEEK_API_KEY
+    # 可选: 覆盖默认出站路径(chat 默认 /v1/chat/completions, responses 默认 /responses)。
+    # path: /v1/chat/completions
+    timeout: 300
+    # 该 provider 支持的(出站)model 列表,作为路由键。
+    # 条目可为字符串(仅 model 名),也可为对象以声明上下文窗口等元数据。
+    # 对象写法的元数据会通过 GET /models 暴露给 codex 等客户端,使其获得真实上下文长度。
+    models:
+      - name: deepseek-v4-pro
+        context_window: 1000000          # 上下文窗口(token);codex 据此计算可用上下文
+        # max_context_window: 131072    # 可选;省略时与 context_window 一致
+        # auto_compact_token_limit: 117964  # 可选;省略时 codex 取上下文的 90%
+        # effective_context_window_percent: 95  # 可选;覆盖 defaults.effective_context_window_percent
+        # display_name: DeepSeek V4 Pro # 可选;省略时回退为 slug
+        # description: DeepSeek coding model  # 可选;/models 展示描述
+        # base_instructions: ""         # 可选;覆盖该模型的 codex 系统提示词
+      - deepseek-v4-flash               # 字符串写法:不暴露上下文窗口元数据
+
+  - name: mimo
+    enabled: true
+    weight: 1
+    outbound: chat_completions
+    base_url: https://token-plan-cn.xiaomimimo.com
+    api_key_env: MIMO_TOKEN_API_KEY
+    # 是否支持 web_search 内置工具(mimo 等 provider 支持此功能)
+    # 启用后,Responses 协议的 web_search 工具会透传给上游;不支持的 provider 自动丢弃。
+    # 注意: 联网搜索需先在 mimo 后台开通"联网服务插件"(账户/计划级开关);
+    # 未开通时请保持 false,否则带 web_search 工具的请求会被上游拒绝(400)。
+    web_search: false
+    # 是否在出站请求体顶层附加 webSearchEnabled=true(仅当请求确实携带 web_search 工具时)。
+    # 部分端点(如已开通联网的 token-plan)要求此顶层开关;标准端点 api.xiaomimimo.com
+    # 不需要也不识别此字段,保持默认 false 即可。
+    # web_search_enabled: true
+    web_search_enabled: false
+    models:
+      - mimo-v2.5-pro
+      - mimo-v2.5
+
+  - name: custom_responses
+    enabled: true
+    weight: 1
+    # 出站协议 responses: 上游本身就是 OpenAI Responses 协议,代理只做"全透传"——
+    # 请求体/响应体不做任何协议转换,仅注入 api_key(apikey 代理)并支持 /models 上下文代理。
+    # 仅当 model_map 配置了改名时才会改写请求体中的 model 字段,其余字段一字不动。
+    outbound: responses
+    # 默认出站路径为 /responses;上游 base_url 末尾常带 /v1,拼出 .../v1/responses。
+    # 若 base_url 为根地址,可显式 path: /v1/responses。
+    base_url: https://responses-gateway.example.com/v1
+    api_key_env: INNER_DAILY_API_KEY
+    timeout: 300
+    models:
+      - name: gpt-5.5
+        context_window: 1050000
+
+defaults:
+  # /models 目录的全局默认上下文窗口(token):未单独配置 context_window 的模型回退到此。
+  # 不设置时,未配置上下文的模型不会出现在 /models 中(codex 沿用其自身 fallback 元数据)。
+  # context_window: 131072
+  # effective_context_window_percent: 95   # 可用上下文百分比(codex 默认 95)
+  # /models 条目基于完整 ModelInfo 模板克隆,默认取 codex gpt-5.5(内置)。
+  # 默认已自带 codex 真实 base_instructions;如需覆盖系统提示词或整体替换模板:
+  # base_instructions: ""                   # 覆盖模型系统提示词(见 docs/user-manual/zh/4-integrations/4.1-codex.md)
+  # model_template: /path/to/model_info.json  # 自定义 ModelInfo 模板文件
+
+options:
+  # 全局默认选项。查找顺序(三选一,优先级递减):
+  #   1. provider 内直接写同名字段 → 最高优先,覆盖全局;
+  #   2. 这里的全局值 → 未在 provider 中指定时生效;
+  #   3. 代码硬编码默认值 → 两者都未配置时生效(均为 true)。
+  # 所以: 全局 options 批量设默认,provider 级可逐个覆盖。
+  # chat 出站时是否透传未识别的顶层字段。
+  passthrough_unknown: true
