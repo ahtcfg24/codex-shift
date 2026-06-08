@@ -447,6 +447,11 @@ ADMIN_HTML = """<!doctype html>
     h1 { margin: 0; font-size: 21px; letter-spacing: 0; }
     .subtitle { margin-top: 2px; color: var(--muted); }
     main { max-width: 1360px; margin: 0 auto; padding: 18px 22px 36px; }
+    .top-actions {
+      display: grid;
+      justify-items: end;
+      gap: 6px;
+    }
     .toolbar, .inline-actions, .model-actions {
       display: flex;
       align-items: center;
@@ -487,23 +492,22 @@ ADMIN_HTML = """<!doctype html>
       background: var(--panel-soft);
     }
     .section-title { font-weight: 720; }
-    #status { min-height: 20px; color: var(--muted); }
+    #status {
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      text-align: right;
+    }
     #status.error { color: var(--danger); }
     #status.ok { color: var(--ok); }
     .table-wrap { overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; min-width: 1040px; }
     .providers-table {
-      table-layout: fixed;
-      min-width: 1712px;
+      display: block;
+      min-width: 0;
     }
-    .providers-table .col-provider { width: 190px; }
-    .providers-table .col-enabled { width: 84px; }
-    .providers-table .col-weight { width: 84px; }
-    .providers-table .col-protocol { width: 172px; }
-    .providers-table .col-upstream { width: 310px; }
-    .providers-table .col-auth { width: 220px; }
-    .providers-table .col-models { width: 560px; }
-    .providers-table .col-actions { width: 92px; }
+    .providers-table tbody { display: block; }
     th, td {
       padding: 11px 12px;
       text-align: left;
@@ -526,24 +530,161 @@ ADMIN_HTML = """<!doctype html>
     .field-stack { display: grid; gap: 7px; min-width: 180px; }
     .field-note { color: var(--muted); font-size: 12px; }
     .provider-name { min-width: 150px; }
-    .endpoint { min-width: 260px; }
-    .number { width: 60px; min-width: 60px; max-width: none; }
-    .protocol-select { min-width: 148px; }
-    .models-editor { display: grid; gap: 8px; min-width: 520px; }
-    .model-row {
-      display: grid;
-      grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) 128px 34px;
-      align-items: center;
-      gap: 7px;
+    .provider-name-input {
+      width: min(20ch, 100%);
+      border-color: transparent;
+      background: transparent;
+      padding: 0;
+      min-height: 24px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 650;
     }
-    .model-header {
-      display: grid;
-      grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) 128px 34px;
-      gap: 7px;
+    .provider-name-input:hover { border-color: transparent; }
+    .provider-controls {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .weight-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
       color: var(--muted);
       font-size: 12px;
       font-weight: 650;
     }
+    .endpoint { min-width: 260px; }
+    .number { width: 60px; min-width: 60px; max-width: none; }
+    .protocol-select { min-width: 148px; }
+    .switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .switch input {
+      position: absolute;
+      inline-size: 1px;
+      block-size: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .switch-track {
+      position: relative;
+      width: 42px;
+      height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      transition: background .16s ease, border-color .16s ease;
+    }
+    .switch-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 16px;
+      height: 16px;
+      border-radius: 999px;
+      background: var(--muted);
+      transition: transform .16s ease, background .16s ease;
+    }
+    .switch input:checked + .switch-track {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 24%, var(--panel));
+    }
+    .switch input:checked + .switch-track::after {
+      transform: translateX(18px);
+      background: var(--accent);
+    }
+    .switch input:focus-visible + .switch-track { box-shadow: var(--focus); }
+    .provider-main-row {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 13px 12px 8px;
+    }
+    .provider-main-row td {
+      display: block;
+      padding: 0;
+      border-bottom: 0;
+    }
+    .provider-main-row td:first-child {
+      flex: 0 1 240px;
+      min-width: 0;
+    }
+    .provider-main-row td:last-child {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .provider-models-row { display: block; }
+    .provider-detail-cell {
+      display: block;
+      padding: 0 12px 16px 48px;
+      border-bottom: 1px solid var(--line);
+    }
+    .provider-detail-panel {
+      display: grid;
+      gap: 16px;
+      max-width: 760px;
+    }
+    .provider-outbound-panel,
+    .provider-auth-panel { display: grid; gap: 8px; }
+    .provider-outbound-fields,
+    .provider-auth-fields {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .field-label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .field-label > input,
+    .field-label > select {
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 400;
+    }
+    .provider-outbound-title,
+    .provider-auth-title,
+    .provider-models-title {
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 760;
+    }
+    .models-editor { display: grid; gap: 8px; min-width: 0; }
+    .model-item {
+      display: grid;
+      gap: 7px;
+    }
+    .model-column-hints,
+    .model-summary,
+    .model-context-row {
+      display: grid;
+      grid-template-columns: 34px minmax(180px, 1fr) minmax(180px, 1fr) 34px;
+      align-items: center;
+      gap: 7px;
+    }
+    .model-column-hints {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .model-context-row {
+      grid-template-columns: 34px minmax(180px, 1fr) minmax(180px, 1fr) 34px;
+    }
+    .model-context-row.is-collapsed { display: none; }
+    .model-context-field { grid-column: 2 / span 2; }
     .icon-button {
       width: 34px;
       padding: 0;
@@ -579,6 +720,8 @@ ADMIN_HTML = """<!doctype html>
     .empty { color: var(--muted); padding: 16px; }
     @media (max-width: 820px) {
       .topbar { align-items: flex-start; flex-direction: column; }
+      .top-actions { justify-items: start; }
+      #status { text-align: left; }
       main { padding: 14px; }
     }
   </style>
@@ -590,10 +733,13 @@ ADMIN_HTML = """<!doctype html>
         <h1>codex-shift 控制台</h1>
         <div class="subtitle">Provider、模型和上下文窗口热管理</div>
       </div>
-      <div class="toolbar">
-        <button id="add-provider">新增 Provider</button>
-        <button id="refresh">刷新</button>
-        <button id="save" class="primary">保存并热加载</button>
+      <div class="top-actions">
+        <div class="toolbar">
+          <button id="add-provider">新增 Provider</button>
+          <button id="refresh">刷新</button>
+          <button id="save" class="primary">保存并热加载</button>
+        </div>
+        <div id="status" aria-live="polite"></div>
       </div>
     </div>
   </header>
@@ -601,32 +747,9 @@ ADMIN_HTML = """<!doctype html>
     <section class="section">
       <div class="section-head">
         <div class="section-title">Provider 路由池</div>
-        <div id="status"></div>
       </div>
       <div class="table-wrap">
         <table class="providers-table">
-          <colgroup>
-            <col class="col-provider">
-            <col class="col-enabled">
-            <col class="col-weight">
-            <col class="col-protocol">
-            <col class="col-upstream">
-            <col class="col-auth">
-            <col class="col-models">
-            <col class="col-actions">
-          </colgroup>
-          <thead>
-            <tr>
-              <th>Provider</th>
-              <th>启用 Provider</th>
-              <th>权重</th>
-              <th>协议</th>
-              <th>上游</th>
-              <th>鉴权</th>
-              <th>模型与上下文窗口</th>
-              <th>操作</th>
-            </tr>
-          </thead>
           <tbody id="providers"></tbody>
         </table>
       </div>
@@ -690,6 +813,7 @@ ADMIN_HTML = """<!doctype html>
           name: m.name || "",
           mapped_model: m.mapped_model || m.name || "",
           context_window: m.context_window ?? "",
+          collapsed: Boolean(m.collapsed),
         })),
       };
     }
@@ -776,19 +900,29 @@ ADMIN_HTML = """<!doctype html>
 
     function renderModels(provider, providerIndex) {
       const rows = provider.model_items.map((model, modelIndex) => `
-        <div class="model-row">
-          <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="name"
-                 value="${esc(model.name)}" placeholder="入站模型">
-          <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="mapped_model"
-                 value="${esc(model.mapped_model || model.name)}" placeholder="出站模型">
-          <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="context_window"
-                 value="${esc(model.context_window)}" inputmode="numeric" placeholder="context_window">
-          <button class="icon-button danger" data-action="delete-model" data-provider="${providerIndex}" data-model="${modelIndex}" title="删除模型">×</button>
+        <div class="model-item">
+          <div class="model-summary">
+            <button class="icon-button" data-action="toggle-model" data-provider="${providerIndex}" data-model="${modelIndex}" title="${model.collapsed ? "展开上下文窗口设置" : "收起上下文窗口设置"}">${model.collapsed ? "+" : "−"}</button>
+            <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="name"
+                   value="${esc(model.name)}" placeholder="入站模型">
+            <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="mapped_model"
+                   value="${esc(model.mapped_model || model.name)}" placeholder="出站模型">
+            <button class="icon-button danger" data-action="delete-model" data-provider="${providerIndex}" data-model="${modelIndex}" title="删除模型">×</button>
+          </div>
+          <div class="model-context-row ${model.collapsed ? "is-collapsed" : ""}">
+            <span></span>
+            <label class="field-label model-context-field">
+              上下文窗口
+              <input data-provider="${providerIndex}" data-model="${modelIndex}" data-field="context_window"
+                     value="${esc(model.context_window)}" inputmode="numeric" placeholder="context_window">
+            </label>
+            <span></span>
+          </div>
         </div>
       `).join("");
       return `
         <div class="models-editor">
-          <div class="model-header"><span>入站模型</span><span>出站模型</span><span>上下文窗口</span><span></span></div>
+          <div class="model-column-hints"><span></span><span>入站模型</span><span>出站模型</span><span></span></div>
           ${rows || `<div class="field-note">暂无模型</div>`}
           <div class="model-actions">
             <button data-action="add-model" data-provider="${providerIndex}">添加模型</button>
@@ -800,46 +934,78 @@ ADMIN_HTML = """<!doctype html>
     function renderProviders() {
       tbody.innerHTML = "";
       if (!providers.length) {
-        tbody.innerHTML = `<tr><td colspan="8" class="empty">暂无 provider，请先新增。</td></tr>`;
+        tbody.innerHTML = `<tr><td class="empty">暂无 provider，请先新增。</td></tr>`;
         return;
       }
       providers.forEach((p, index) => {
         const tr = document.createElement("tr");
+        tr.className = "provider-main-row";
         tr.innerHTML = `
           <td>
             <div class="field-stack provider-name">
-              <input data-provider="${index}" data-field="name" value="${esc(p.name)}" placeholder="provider name">
-              <span class="field-note">${p.enabled ? "运行中" : "已停用"}</span>
-            </div>
-          </td>
-          <td><input type="checkbox" data-provider="${index}" data-field="enabled" ${p.enabled ? "checked" : ""}></td>
-          <td><input class="number" type="number" min="0" step="0.1" data-provider="${index}" data-field="weight" value="${esc(p.weight)}"></td>
-          <td>
-            <select class="protocol-select" data-provider="${index}" data-field="outbound">
-              <option value="chat_completions" ${p.outbound === "chat_completions" ? "selected" : ""}>chat_completions</option>
-              <option value="responses" ${p.outbound === "responses" ? "selected" : ""}>responses</option>
-            </select>
-          </td>
-          <td>
-            <div class="field-stack endpoint">
-              <input data-provider="${index}" data-field="base_url" value="${esc(p.base_url)}" placeholder="https://api.example.com">
-              <input data-provider="${index}" data-field="path" value="${esc(p.path)}" placeholder="path, 可留空使用默认">
+              <input class="provider-name-input" data-provider="${index}" data-field="name" value="${esc(p.name)}" title="${esc(p.name)}" placeholder="provider name">
             </div>
           </td>
           <td>
-            <div class="field-stack">
-              <input data-provider="${index}" data-field="api_key_env" value="${esc(p.api_key_env)}" placeholder="API_KEY_ENV">
-              <input data-provider="${index}" data-field="api_key" value="" placeholder="${p.api_key_set ? "已设置，留空保留" : "直接 API Key，可留空"}">
-            </div>
-          </td>
-          <td>${renderModels(p, index)}</td>
-          <td>
-            <div class="inline-actions">
+            <div class="provider-controls">
+            <label class="switch" title="${p.enabled ? "运行中" : "已停用"}">
+              <input type="checkbox" data-provider="${index}" data-field="enabled" ${p.enabled ? "checked" : ""}>
+              <span class="switch-track" aria-hidden="true"></span>
+              <span>${p.enabled ? "运行中" : "已停用"}</span>
+            </label>
+              <label class="weight-control">
+                权重
+                <input class="number" type="number" min="0" step="0.1" data-provider="${index}" data-field="weight" value="${esc(p.weight)}">
+              </label>
               <button class="danger" data-action="delete-provider" data-provider="${index}">删除</button>
             </div>
           </td>
         `;
         tbody.appendChild(tr);
+        const modelsTr = document.createElement("tr");
+        modelsTr.className = "provider-models-row";
+        modelsTr.innerHTML = `
+          <td class="provider-detail-cell">
+            <div class="provider-detail-panel">
+              <div class="provider-outbound-panel">
+                <div class="provider-outbound-title">出站配置</div>
+                <div class="provider-outbound-fields">
+                  <label class="field-label">
+                    出站协议
+                    <select class="protocol-select" data-provider="${index}" data-field="outbound">
+                      <option value="chat_completions" ${p.outbound === "chat_completions" ? "selected" : ""}>chat_completions</option>
+                      <option value="responses" ${p.outbound === "responses" ? "selected" : ""}>responses</option>
+                    </select>
+                  </label>
+                  <label class="field-label">
+                    出站 URL
+                    <input data-provider="${index}" data-field="base_url" value="${esc(p.base_url)}" placeholder="https://api.example.com">
+                  </label>
+                  <label class="field-label">
+                    出站路径
+                    <input data-provider="${index}" data-field="path" value="${esc(p.path)}" placeholder="path, 可留空使用默认">
+                  </label>
+                </div>
+              </div>
+              <div class="provider-auth-panel">
+                <div class="provider-auth-title">鉴权配置</div>
+                <div class="provider-auth-fields">
+                  <label class="field-label">
+                    环境变量
+                    <input data-provider="${index}" data-field="api_key_env" value="${esc(p.api_key_env)}" placeholder="API_KEY_ENV">
+                  </label>
+                  <label class="field-label">
+                    直接 API Key
+                    <input data-provider="${index}" data-field="api_key" value="" placeholder="${p.api_key_set ? "已设置，留空保留" : "直接 API Key，可留空"}">
+                  </label>
+                </div>
+              </div>
+              <div class="provider-models-title">模型设置</div>
+              ${renderModels(p, index)}
+            </div>
+          </td>
+        `;
+        tbody.appendChild(modelsTr);
       });
     }
 
@@ -922,9 +1088,12 @@ ADMIN_HTML = """<!doctype html>
       if (button.dataset.action === "delete-provider") {
         providers.splice(pIndex, 1);
       } else if (button.dataset.action === "add-model") {
-        providers[pIndex].model_items.push({name: "", mapped_model: "", context_window: ""});
+        providers[pIndex].model_items.push({name: "", mapped_model: "", context_window: "", collapsed: false});
       } else if (button.dataset.action === "delete-model") {
         providers[pIndex].model_items.splice(mIndex, 1);
+      } else if (button.dataset.action === "toggle-model") {
+        const item = providers[pIndex]?.model_items?.[mIndex];
+        if (item) item.collapsed = !item.collapsed;
       }
       render();
     });

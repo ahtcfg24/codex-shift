@@ -38,7 +38,35 @@ def test_admin_lists_all_providers_and_html(tmp_path):
     assert "Provider 概览" not in page.text
     assert "metric-total" not in page.text
     assert "模型路由表" in page.text
-    assert "启用 Provider" in page.text
+    assert "provider-models-row" in page.text
+    assert "provider-controls" in page.text
+    assert "weight-control" in page.text
+    assert "col-models" not in page.text
+    assert "provider-auth-panel" in page.text
+    assert "provider-outbound-panel" in page.text
+    assert "provider-name-input" in page.text
+    assert "switch-track" in page.text
+    assert "模型设置" in page.text
+    assert "鉴权配置" in page.text
+    assert "出站协议" in page.text
+    assert "出站 URL" in page.text
+    assert "model-column-hints" in page.text
+    assert "<span>入站模型</span><span>出站模型</span>" in page.text
+    assert "col-auth" not in page.text
+    assert "col-actions" not in page.text
+    assert "provider-detail-cell" in page.text
+    assert "colspan=" not in page.text.split('<table class="providers-table">', 1)[1].split('<tbody id="routes">', 1)[0]
+    assert '<table class="providers-table">' in page.text
+    assert '<thead>' not in page.text.split('<table class="providers-table">', 1)[1].split('<tbody id="providers">', 1)[0]
+    assert "<th>Provider</th>" not in page.text
+    assert "<th>路由状态</th>" not in page.text
+    assert "<th>权重</th>" not in page.text
+    assert "<th>协议</th>" not in page.text
+    assert "<th>上游</th>" not in page.text
+    assert "<th>鉴权</th>" not in page.text
+    assert "<th>操作</th>" not in page.text
+    assert '<div id="status" aria-live="polite"></div>' in page.text
+    assert '<div class="section-title">Provider 路由池</div>\n      </div>' in page.text
     assert "renderRoutes" in page.text
 
     resp = client.get("/admin/api/config")
