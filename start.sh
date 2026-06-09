@@ -169,6 +169,14 @@ selected_port = target_port
 changed = 0
 
 if not can_bind(target_port):
+    # 等待刚被杀掉的进程释放端口（TIME_WAIT），最多等 5 秒
+    import time as _time
+    for _ in range(10):
+        _time.sleep(0.5)
+        if can_bind(target_port):
+            break
+
+if not can_bind(target_port):
     for candidate in range(search_start, 65536):
         if can_bind(candidate):
             selected_port = candidate
