@@ -58,16 +58,16 @@ $EDITOR .env
 ./start.sh
 ```
 
-`start.sh` 会自动准备虚拟环境、安装依赖、复制 `config.yaml`、加载项目 `.env`、处理端口占用并在后台启动服务。启动完成后访问 `GET /health` 验证服务状态。
+`start.sh` 会自动准备虚拟环境、安装依赖、复制 `config.yaml`、加载项目 `.env`、处理端口占用，并默认通过系统 service 启动服务。macOS 使用 LaunchAgent，重启后用户登录即自动拉起；Linux 使用 systemd user service，并尝试启用 linger 以支持重启后自动启动。启动完成后访问 `GET /health` 验证服务状态。
 
 ### 常用命令
 
 ```bash
-./start.sh                    # 启动服务
-./start.sh --log-level debug  # 启动并输出 debug 日志
-./start.sh status             # 查看运行状态
-./start.sh restart            # 重启服务
-./start.sh stop               # 停止服务
+./start.sh                    # 启动/重启 service 并启用自启动
+./start.sh --log-level debug  # 用 debug 日志参数启动/重启 service
+./start.sh status             # 查看 service 运行状态
+./start.sh restart            # 重启 service
+./start.sh stop               # 停止当前 service 实例,自启动配置保留
 ```
 
 默认监听地址来自 `config.yaml` 的 `server.host` 与 `server.port`。示例配置使用 `127.0.0.1:8080`，本地控制台地址为：
@@ -112,7 +112,7 @@ codex_shift/
 ├── docs/user-manual/zh/      # 中文用户手册
 ├── config.example.yaml       # 配置示例
 ├── .env.example              # 环境变量示例
-└── start.sh                  # 本地启动与守护脚本
+└── start.sh                  # service 启动与自启动脚本
 ```
 
 ## 开发与测试

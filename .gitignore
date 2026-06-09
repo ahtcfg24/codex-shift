@@ -24,6 +24,7 @@ Thumbs.db
 # === Runtime (local) ===
 .codex-shift.pid
 .codex-shift.log
+.codex-shift-service-runner.sh
 
 # === Sensitive config (contains real API keys) ===
 config.yaml

@@ -1,29 +1,33 @@
 #!/usr/bin/env bash
-# codex-shift 一键本地启动脚本(后台守护进程)
+# codex-shift 一键本地启动脚本(系统 service)
 #
 # 默认行为(start):
-#   1. 准备虚拟环境 .venv(优先 uv;否则回退 python3 -m venv)
-#   2. 按需安装依赖(仅当检测到缺失时)
-#   3. 缺少 config.yaml 时从 config.example.yaml 复制
-#   4. 默认加载项目 .env(提供 DEEPSEEK_API_KEY 等)
-#   5. 杀掉已有实例(PID 文件 + 命令行匹配)
-#   6. 若配置端口被占用,自动从 10000 起寻找可用端口并写回 config.yaml
-#   7. 后台启动新进程,并轮询 /health 确认就绪
+#   1. 生成/更新当前项目的 launchd 或 systemd user service
+#   2. 启用 service 自启动(macOS 为用户登录后自启,Linux 会尝试启用 linger)
+#   3. 准备虚拟环境、依赖、config.yaml 和 .env
+#   4. 停止已有实例并检查端口占用
+#   5. 通过 service 启动前台进程,并轮询 /health 确认就绪
 #
 # 子命令:
-#   ./start.sh [启动参数...]   启动(默认),额外参数透传给服务,如 --log-level debug
-#   ./start.sh stop            停止后台进程
-#   ./start.sh status          查看运行状态
-#   ./start.sh restart [参数]  重启
+#   ./start.sh [启动参数...]      启动/重启 service(默认),额外参数透传给服务,如 --log-level debug
+#   ./start.sh stop               停止当前 service 实例(自启配置保留)
+#   ./start.sh status             查看 service 运行状态
+#   ./start.sh restart [参数]     重启 service
+#   ./start.sh run [启动参数...]  内部前台入口,供 service manager 调用
 
 set -euo pipefail
-cd "$(dirname "$0")"
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+cd "$ROOT_DIR"
 
 VENV_DIR=".venv"
 PY="$VENV_DIR/bin/python"
 PYTHON_VERSION="3.12"
 PID_FILE=".codex-shift.pid"
 LOG_FILE=".codex-shift.log"
+RUNNER_FILE=".codex-shift-service-runner.sh"
+SERVICE_ID="$(printf '%s' "$ROOT_DIR" | cksum | awk '{print $1}')"
+SERVICE_LABEL="com.codex-shift.$SERVICE_ID"
+SERVICE_UNIT="codex-shift-$SERVICE_ID.service"
 # 用于命令行匹配的进程特征(杀掉历史实例)
 PROC_PATTERN="codex_shift --config"
 
@@ -178,32 +182,12 @@ print(selected_port, changed, search_start)
 PYCODE
 }
 
-# --- stop 子命令 ---
-if [ "${1:-}" = "stop" ]; then
-  kill_existing
-  echo "[start] 已停止"
-  exit 0
-fi
-
-# --- status 子命令 ---
-if [ "${1:-}" = "status" ]; then
-  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-    echo "[start] 运行中, PID=$(cat "$PID_FILE")"
-    exit 0
+# --- 准备 Python 环境 ---
+ensure_python_env() {
+  if [ -x "$PY" ]; then
+    return
   fi
-  echo "[start] 未运行"
-  exit 1
-fi
 
-# --- restart: 等价于杀掉后继续走 start 流程 ---
-if [ "${1:-}" = "restart" ]; then
-  shift
-fi
-
-# === 以下为 start 流程 ===
-
-# --- 1. 准备虚拟环境 ---
-if [ ! -x "$PY" ]; then
   echo "[start] 未发现虚拟环境,正在创建 $VENV_DIR ..."
   if command -v uv >/dev/null 2>&1; then
     uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
@@ -213,75 +197,378 @@ if [ ! -x "$PY" ]; then
     echo "[start] 错误: 未找到 uv 或 python3,无法创建虚拟环境" >&2
     exit 1
   fi
-fi
+}
 
-# --- 2. 安装依赖(仅当关键依赖缺失时) ---
-if ! "$PY" -c "import fastapi, uvicorn, httpx, yaml" >/dev/null 2>&1; then
+# --- 安装运行依赖 ---
+ensure_dependencies() {
+  if "$PY" -c "import fastapi, uvicorn, httpx, yaml" >/dev/null 2>&1; then
+    return
+  fi
+
   echo "[start] 正在安装依赖 ..."
   if command -v uv >/dev/null 2>&1; then
     uv pip install --python "$PY" -r requirements.txt
   else
     "$PY" -m pip install -r requirements.txt
   fi
-fi
+}
 
-# --- 3. 准备配置文件 ---
-if [ ! -f config.yaml ]; then
+# --- 准备配置文件 ---
+ensure_config() {
+  if [ -f config.yaml ]; then
+    return
+  fi
+
   echo "[start] 未发现 config.yaml,已从 config.example.yaml 复制(请按需修改)"
   cp config.example.yaml config.yaml
-fi
+}
 
-# --- 4. 加载 .env(若存在) ---
-load_env
+# --- 准备运行时并计算健康检查地址 ---
+prepare_runtime() {
+  ensure_python_env
+  ensure_dependencies
+  ensure_config
+  load_env
 
-# --- 5. 读取配置并校验 API Key ---
-read HOST PORT KEY_EMPTY < <(read_config)
-if [ "$KEY_EMPTY" = "1" ]; then
-  echo "[start] 警告: 上游 API Key 为空,上游可能返回 401。" \
-       "请在 config.yaml 设置 api_key,或导出对应环境变量(如 DEEPSEEK_API_KEY)。"
-fi
-
-# --- 6. 杀掉已有实例并确认监听端口 ---
-kill_existing
-PORT_SELECTION="$(select_port "$HOST" "$PORT")"
-read SELECTED_PORT PORT_CHANGED PORT_SEARCH_START <<<"$PORT_SELECTION"
-if [ "$PORT_CHANGED" = "1" ]; then
-  echo "[start] 端口 $PORT 已被占用,已自动选择 $SELECTED_PORT 并写回 config.yaml"
-  echo "[start] 端口搜索起点: $PORT_SEARCH_START"
-  PORT="$SELECTED_PORT"
-fi
-# 探活地址: 0.0.0.0 监听时用 127.0.0.1 探测
-PROBE_HOST="$HOST"
-[ "$PROBE_HOST" = "0.0.0.0" ] && PROBE_HOST="127.0.0.1"
-
-# --- 7. 后台启动 ---
-echo "[start] 后台启动 codex-shift (日志: $LOG_FILE) ..."
-# nohup 脱离终端;输出追加到日志文件
-nohup "$PY" -m codex_shift --config config.yaml "$@" >>"$LOG_FILE" 2>&1 &
-NEWPID=$!
-echo "$NEWPID" > "$PID_FILE"
-
-# --- 轮询 /health 确认就绪(最多 ~15s) ---
-ready=0
-for _ in $(seq 1 30); do
-  # 进程若已退出则立即报错
-  if ! kill -0 "$NEWPID" 2>/dev/null; then
-    break
+  read HOST PORT KEY_EMPTY < <(read_config)
+  if [ "$KEY_EMPTY" = "1" ]; then
+    echo "[start] 警告: 上游 API Key 为空,上游可能返回 401。" \
+         "请在 config.yaml 设置 api_key,或导出对应环境变量(如 DEEPSEEK_API_KEY)。"
   fi
-  if curl -s "http://$PROBE_HOST:$PORT/health" >/dev/null 2>&1; then
-    ready=1
-    break
-  fi
-  sleep 0.5
-done
 
-if [ "$ready" = "1" ]; then
-  echo "[start] 已就绪 PID=$NEWPID, 监听 http://$PROBE_HOST:$PORT"
-  echo "[start] 控制台: http://$PROBE_HOST:$PORT/admin"
-  echo "[start] 查看日志: tail -f $LOG_FILE   停止: ./start.sh stop"
-else
+  PORT_SELECTION="$(select_port "$HOST" "$PORT")"
+  read SELECTED_PORT PORT_CHANGED PORT_SEARCH_START <<<"$PORT_SELECTION"
+  if [ "$PORT_CHANGED" = "1" ]; then
+    echo "[start] 端口 $PORT 已被占用,已自动选择 $SELECTED_PORT 并写回 config.yaml"
+    echo "[start] 端口搜索起点: $PORT_SEARCH_START"
+    PORT="$SELECTED_PORT"
+  fi
+
+  # 0.0.0.0 只用于监听;本机探活固定走 127.0.0.1。
+  PROBE_HOST="$HOST"
+  if [ "$PROBE_HOST" = "0.0.0.0" ]; then
+    PROBE_HOST="127.0.0.1"
+  fi
+}
+
+# --- 识别当前系统可用的 service manager ---
+detect_service_backend() {
+  case "$(uname -s)" in
+    Darwin)
+      if ! command -v launchctl >/dev/null 2>&1; then
+        echo "[start] 错误: 当前系统未找到 launchctl" >&2
+        exit 1
+      fi
+      echo "launchd"
+      ;;
+    Linux)
+      if ! command -v systemctl >/dev/null 2>&1; then
+        echo "[start] 错误: 当前系统未找到 systemctl" >&2
+        exit 1
+      fi
+      echo "systemd"
+      ;;
+    *)
+      echo "[start] 错误: 当前系统暂不支持自动 service 启动" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# --- 为 launchd plist 转义 XML 文本 ---
+xml_escape() {
+  local value="$1"
+  value="${value//&/&amp;}"
+  value="${value//</&lt;}"
+  value="${value//>/&gt;}"
+  value="${value//\"/&quot;}"
+  value="${value//\'/&apos;}"
+  printf '%s' "$value"
+}
+
+# --- 为 systemd unit 的带引号字段转义 ---
+systemd_escape_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
+}
+
+launchd_domain() {
+  echo "gui/$(id -u)"
+}
+
+launchd_target() {
+  echo "$(launchd_domain)/$SERVICE_LABEL"
+}
+
+launchd_plist_path() {
+  echo "$HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+}
+
+systemd_unit_path() {
+  echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SERVICE_UNIT"
+}
+
+# --- 生成 service 调用的前台 runner,用于保存启动参数和统一日志 ---
+write_service_runner() {
+  {
+    echo "#!/usr/bin/env bash"
+    echo "set -euo pipefail"
+    printf 'cd %q\n' "$ROOT_DIR"
+    printf 'exec %q run' "$ROOT_DIR/start.sh"
+    for arg in "$@"; do
+      printf ' %q' "$arg"
+    done
+    printf ' >> %q 2>&1\n' "$ROOT_DIR/$LOG_FILE"
+  } > "$RUNNER_FILE"
+  chmod +x "$RUNNER_FILE"
+}
+
+# --- 写入 macOS LaunchAgent 配置 ---
+install_launchd_service() {
+  local plist
+  plist="$(launchd_plist_path)"
+  mkdir -p "$(dirname "$plist")"
+
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(xml_escape "$SERVICE_LABEL")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(xml_escape "$ROOT_DIR/$RUNNER_FILE")</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$(xml_escape "$ROOT_DIR")</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "$ROOT_DIR/$LOG_FILE")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "$ROOT_DIR/$LOG_FILE")</string>
+</dict>
+</plist>
+EOF
+}
+
+# --- 写入 Linux systemd user service 配置 ---
+install_systemd_service() {
+  local unit
+  unit="$(systemd_unit_path)"
+  mkdir -p "$(dirname "$unit")"
+
+  cat > "$unit" <<EOF
+[Unit]
+Description=codex-shift local proxy ($ROOT_DIR)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory="$(systemd_escape_value "$ROOT_DIR")"
+ExecStart=/bin/bash "$(systemd_escape_value "$ROOT_DIR/$RUNNER_FILE")"
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+EOF
+
+  systemctl --user daemon-reload
+}
+
+# --- Linux 用户服务需要 linger 才能在无登录会话时随系统启动 ---
+enable_systemd_linger() {
+  if ! command -v loginctl >/dev/null 2>&1 || [ -z "${USER:-}" ]; then
+    return
+  fi
+
+  if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q "Linger=no"; then
+    if loginctl enable-linger "$USER" >/dev/null 2>&1; then
+      echo "[start] 已为用户 $USER 启用 systemd linger"
+    else
+      echo "[start] 警告: 无法自动启用 systemd linger;重启后可能需要登录用户会话才会启动" >&2
+    fi
+  fi
+}
+
+# --- 根据系统类型安装或更新 service 文件 ---
+install_service() {
+  local backend="$1"
+  case "$backend" in
+    launchd)
+      install_launchd_service
+      ;;
+    systemd)
+      install_systemd_service
+      ;;
+  esac
+}
+
+# --- 停止当前 service 实例,但保留自启动配置 ---
+stop_service_backend() {
+  local backend="$1"
+  case "$backend" in
+    launchd)
+      launchctl bootout "$(launchd_target)" >/dev/null 2>&1 || true
+      ;;
+    systemd)
+      systemctl --user stop "$SERVICE_UNIT" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+# --- 启动并启用 service 自启动 ---
+start_service_backend() {
+  local backend="$1"
+  case "$backend" in
+    launchd)
+      launchctl bootstrap "$(launchd_domain)" "$(launchd_plist_path)"
+      launchctl enable "$(launchd_target)" >/dev/null 2>&1 || true
+      launchctl kickstart -k "$(launchd_target)" >/dev/null 2>&1 || true
+      ;;
+    systemd)
+      systemctl --user enable "$SERVICE_UNIT" >/dev/null
+      enable_systemd_linger
+      systemctl --user restart "$SERVICE_UNIT"
+      ;;
+  esac
+}
+
+# --- 等待 HTTP 健康检查就绪 ---
+wait_for_health() {
+  local ready=0
+  for _ in $(seq 1 30); do
+    if curl -s "http://$PROBE_HOST:$PORT/health" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.5
+  done
+
+  if [ "$ready" = "1" ]; then
+    echo "[start] 已就绪,监听 http://$PROBE_HOST:$PORT"
+    echo "[start] 控制台: http://$PROBE_HOST:$PORT/admin"
+    echo "[start] 查看日志: tail -f $LOG_FILE   停止当前实例: ./start.sh stop"
+    return
+  fi
+
   echo "[start] 启动失败或未就绪,最近日志:" >&2
   tail -n 30 "$LOG_FILE" >&2 || true
-  rm -f "$PID_FILE"
   exit 1
-fi
+}
+
+# --- 兼容旧版 PID 文件状态展示 ---
+legacy_status() {
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+    echo "[start] 旧版后台进程运行中, PID=$(cat "$PID_FILE")"
+    return 0
+  fi
+  return 1
+}
+
+# --- 默认入口: 安装/重启 service 并确认健康状态 ---
+start_managed_service() {
+  local backend
+  backend="$(detect_service_backend)"
+
+  write_service_runner "$@"
+  install_service "$backend"
+  stop_service_backend "$backend"
+  kill_existing
+  prepare_runtime
+
+  echo "[start] 通过 $backend service 启动 codex-shift (日志: $LOG_FILE) ..."
+  start_service_backend "$backend"
+  wait_for_health
+}
+
+# --- stop 子命令 ---
+stop_managed_service() {
+  local backend
+  backend="$(detect_service_backend)"
+  stop_service_backend "$backend"
+  kill_existing
+  echo "[start] 已停止当前 service 实例;自启动配置保留"
+}
+
+# --- status 子命令 ---
+status_managed_service() {
+  local backend
+  backend="$(detect_service_backend)"
+
+  case "$backend" in
+    launchd)
+      if launchctl print "$(launchd_target)" >/dev/null 2>&1; then
+        if launchctl print "$(launchd_target)" 2>/dev/null | grep -q "state = running"; then
+          echo "[start] service 运行中 ($SERVICE_LABEL)"
+          return 0
+        fi
+        echo "[start] service 已安装但当前未运行 ($SERVICE_LABEL)"
+        return 1
+      fi
+      ;;
+    systemd)
+      if systemctl --user is-active --quiet "$SERVICE_UNIT"; then
+        echo "[start] service 运行中 ($SERVICE_UNIT)"
+        return 0
+      fi
+      if systemctl --user is-enabled --quiet "$SERVICE_UNIT" 2>/dev/null; then
+        echo "[start] service 已启用但当前未运行 ($SERVICE_UNIT)"
+        return 1
+      fi
+      ;;
+  esac
+
+  if legacy_status; then
+    return 0
+  fi
+
+  echo "[start] 未运行"
+  return 1
+}
+
+# --- service manager 调用的前台入口 ---
+run_foreground() {
+  prepare_runtime
+  echo "[start] 前台运行 codex-shift ..."
+  exec "$PY" -m codex_shift --config config.yaml "$@"
+}
+
+case "${1:-}" in
+  stop)
+    stop_managed_service
+    ;;
+  status)
+    status_managed_service
+    ;;
+  restart)
+    shift
+    start_managed_service "$@"
+    ;;
+  run)
+    shift
+    run_foreground "$@"
+    ;;
+  start)
+    shift
+    start_managed_service "$@"
+    ;;
+  *)
+    start_managed_service "$@"
+    ;;
+esac
