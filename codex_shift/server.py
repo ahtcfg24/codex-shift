@@ -83,6 +83,23 @@ def _error_response(status_code: int, message: str, *, etype: str = "upstream_er
     return JSONResponse(status_code=status_code, content={"error": err})
 
 
+def _format_upstream_exception(exc: BaseException, provider: ProviderConfig) -> str:
+    """格式化上游异常,确保 httpx 空消息异常也能透给客户端可读原因。"""
+    parts = [type(exc).__name__]
+    text = str(exc).strip()
+    if text:
+        parts.append(text)
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None:
+        cause_text = str(cause).strip()
+        cause_desc = type(cause).__name__
+        if cause_text:
+            cause_desc = f"{cause_desc}: {cause_text}"
+        if cause_desc not in parts:
+            parts.append(cause_desc)
+    return f"上游请求失败({upstream.upstream_url(provider)}): {'; '.join(parts)}"
+
+
 async def _stream_generator(provider: ProviderConfig, payload: dict[str, Any],
                             request_model: str | None, rid: str = "-",
                             name_map: dict[str, dict[str, str]] | None = None) -> AsyncIterator[str]:
@@ -112,7 +129,11 @@ async def _stream_generator(provider: ProviderConfig, payload: dict[str, Any],
         logger.info("[%s] 流式完成, 消费上游事件 %d 条", rid, upstream_events)
     except Exception as exc:  # noqa: BLE001 - 兜底,避免连接悬挂
         logger.exception("[%s] 流式转换过程中发生异常", rid)
-        err_event = {"type": "error", "message": f"proxy error: {exc}"}
+        err_event = {
+            "type": "error",
+            "code": 502,
+            "message": _format_upstream_exception(exc, provider),
+        }
         yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n"
 
 
@@ -137,7 +158,11 @@ async def _passthrough_stream_generator(provider: ProviderConfig, payload: dict[
         logger.info("[%s] 流式透传完成, 转发上游块 %d 个", rid, chunks)
     except Exception as exc:  # noqa: BLE001 - 兜底,避免连接悬挂
         logger.exception("[%s] 流式透传过程中发生异常", rid)
-        err_event = {"type": "error", "message": f"proxy error: {exc}"}
+        err_event = {
+            "type": "error",
+            "code": 502,
+            "message": _format_upstream_exception(exc, provider),
+        }
         yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n"
 
 
@@ -361,7 +386,7 @@ def create_app(cfg: Config, *, config_path: str | None = None) -> FastAPI:
             return _error_response(504, "上游请求超时", etype="timeout_error")
         except Exception as exc:  # noqa: BLE001
             logger.exception("[%s] 上游请求失败", rid)
-            return _error_response(502, f"上游请求失败: {exc}", etype="upstream_error")
+            return _error_response(502, _format_upstream_exception(exc, provider), etype="upstream_error")
 
         logger.info("[%s] 上游响应 status=%s", rid, resp.status_code)
         if resp.status_code >= 400:

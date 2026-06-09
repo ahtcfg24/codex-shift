@@ -130,6 +130,43 @@ def test_stream_passthrough_end_to_end(tmp_path, monkeypatch):
     assert "data: [DONE]" in text
 
 
+def test_stream_passthrough_connection_error_returns_json_502(tmp_path, monkeypatch):
+    """流式预取阶段连接失败时,将可读上游错误透给 API,而不是空 proxy error。"""
+    cfg = _cfg(tmp_path, _CONFIG)
+    app = server.create_app(cfg)
+    client = TestClient(app)
+
+    async def fake_stream_raw(provider, payload):
+        raise httpx.ConnectError("", request=httpx.Request("POST", upstream.upstream_url(provider)))
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(server.upstream, "stream_raw", fake_stream_raw)
+    r = client.post("/v1/responses", json={"model": "gpt-alias", "input": "hi", "stream": True})
+    assert r.status_code == 502
+    body = r.json()
+    assert body["error"]["type"] == "upstream_error"
+    assert "ConnectError" in body["error"]["message"]
+    assert "https://gw.example.com/v1/responses" in body["error"]["message"]
+    assert "event: error" in body["error"]["raw"]
+
+
+def test_nonstream_connection_error_includes_exception_type(tmp_path, monkeypatch):
+    """非流式连接失败时,客户端也能看到异常类型与上游地址。"""
+    cfg = _cfg(tmp_path, _CONFIG)
+    app = server.create_app(cfg)
+    client = TestClient(app)
+
+    async def fake_forward(provider, payload):
+        raise httpx.ConnectError("", request=httpx.Request("POST", upstream.upstream_url(provider)))
+
+    monkeypatch.setattr(server.upstream, "forward_json", fake_forward)
+    r = client.post("/v1/responses", json={"model": "gpt-alias", "input": "hi"})
+    assert r.status_code == 502
+    message = r.json()["error"]["message"]
+    assert "ConnectError" in message
+    assert "https://gw.example.com/v1/responses" in message
+
+
 def test_responses_model_exposed_in_catalog(tmp_path):
     """context_window 代理仍生效: responses provider 的模型出现在 /models 目录。"""
     cfg = _cfg(tmp_path, _CONFIG)
